@@ -115,22 +115,19 @@ class Heatmap:
     def _maybe_autofit(self, book) -> None:
         """One-time zoom centered on the touch.
 
-        Equity books are sparse and wide (a handful of levels, the far ones $$ away),
-        so fitting the *furthest* level scatters everything into empty space. Instead
-        size the band to the bulk of levels — the 70th percentile of level distances
-        from mid — so the dense near-touch region fills the view. Far outliers clip;
-        use +/- to zoom manually."""
+        Equity books are sparse and wide (a few levels near the touch, the rest $$
+        away), and how far they spread is unpredictable — so deriving the band from
+        the book just zooms out and buries the action. Use a deterministic price-based
+        band instead: ~0.15% of price each side, clamped to a sane $ range. Far levels
+        clip off-screen; use +/- to change the zoom."""
         if self._fitted or not self.autofit or book is None:
             return
         mid = book.mid
         if mid is None:
             return
-        dists = sorted(abs(p - mid) for p, _ in book.levels())
-        if len(dists) >= 4:
-            q = dists[int(len(dists) * 0.70)]
-            half = max(q * 1.3, 25 * self.tick)               # ≥25 ticks each side
-            self.n_rows = int(np.clip(round(2 * half / self.tick), 60, 240))
-            self.matrix = np.zeros((self.n_rows, self.n_cols))
+        half = float(np.clip(mid * 0.0015, 0.15, 1.00))
+        self.n_rows = int(np.clip(round(2 * half / self.tick), 60, 240))
+        self.matrix = np.zeros((self.n_rows, self.n_cols))
         self._set_center(mid)
         self._fitted = True
 
@@ -225,7 +222,7 @@ def _trade_xyc(hm: Heatmap):
             continue
         xs.append(t["col"])
         ys.append(r)
-        ss.append(float(np.clip(14 + 46 * np.sqrt(t["size"] / ref), 10, 340)))
+        ss.append(float(np.clip(22 + 60 * np.sqrt(t["size"] / ref), 18, 420)))
         cs.append(BUY if t["side"] > 0 else SELL if t["side"] < 0 else NEUTRAL)
     return xs, ys, ss, cs
 
@@ -296,7 +293,7 @@ def build_figure(hm: Heatmap, title: str):
     from matplotlib.colors import PowerNorm
     im = ax.imshow(hm.matrix, aspect="auto", origin="lower", cmap="inferno",
                    interpolation="nearest", animated=True,
-                   norm=PowerNorm(gamma=0.5, vmin=0, vmax=1))
+                   norm=PowerNorm(gamma=0.45, vmin=0, vmax=1))
     (mid_ln,) = ax.plot([], [], color=MID, lw=1.1, alpha=0.9, zorder=4)
     scat = ax.scatter([], [], s=[], c=[], edgecolors="none", alpha=0.85, zorder=5)
     # microstructure overlays (Phase 5C): walls ◄ at right edge, icebergs ◆, pull flags ✕
@@ -412,9 +409,23 @@ def main():
     fig.text(0.99, 0.013, "+ / −  zoom     m  overlays", color=NEUTRAL,
              fontsize=8.5, ha="right", va="center")
 
+    diag_frames = {"n": 0}
+
     def update(_):
         book = state.get_book()
         trades = [] if args.no_trades else state.drain_trades()
+
+        if args.diag:
+            diag_frames["n"] += 1
+            if diag_frames["n"] in (40, 100) and hm.row0_price is not None:
+                nzc = int((hm.matrix > 0).sum())
+                lo = hm.row0_price
+                hi = lo + hm.n_rows * hm.tick
+                print(f"[diag] HEATMAP frame {diag_frames['n']}: rows={hm.n_rows} "
+                      f"window {lo:.2f}–{hi:.2f} | nonzero {nzc} "
+                      f"({100 * nzc / hm.matrix.size:.1f}%) | matrix_max "
+                      f"{hm.matrix.max():.0f} | size_ref {hm.size_ref:.0f} | "
+                      f"bubbles {len(hm.trades)}", flush=True)
 
         micro = None
         if ctx["micro"] is not None:
