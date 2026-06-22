@@ -1,0 +1,38 @@
+{
+  "service": "NASDAQ_BOOK",
+  "content": [
+    {
+      "key": "GOOG",
+      "BOOK_TIME": 1782144614895,
+      "BIDS": [
+        {
+          "BID_PRICE": 344.80,
+          "TOTAL_VOLUME": 120,
+          "NUM_BIDS": 1,
+          "BIDS": [
+            { "EXCHANGE": "NSDQ", "BID_VOLUME": 120, "SEQUENCE": 43814837 }
+          ]
+        },
+        {
+          "BID_PRICE": 344.67,
+          "TOTAL_VOLUME": 200,
+          "NUM_BIDS": 2,
+          "BIDS": [
+            { "EXCHANGE": "edgx", "BID_VOLUME": 120, "SEQUENCE": 43814848 },
+            { "EXCHANGE": "batx", "BID_VOLUME": 80, "SEQUENCE": 43814848 }
+          ]
+        }
+      ],
+      "ASKS": [
+        {
+          "ASK_PRICE": 344.90,
+          "TOTAL_VOLUME": 100,
+          "NUM_ASKS": 1,
+          "ASKS": [
+            { "EXCHANGE": "arcx", "ASK_VOLUME": 100, "SEQUENCE": 43814900 }
+          ]
+        }
+      ]
+    }
+  ]
+}
