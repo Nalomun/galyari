@@ -123,19 +123,32 @@ renderer is identical across all three modes.
 | `--symbol SYM` | `$SCHWAB_SYMBOL` or `GOOG` | symbol to subscribe |
 | `--watchlist A,B,C` | `$SCHWAB_WATCHLIST` | symbols to cycle with `n`/`p` (live) |
 | `--tick T` | `0.01` | price bin size (dollars) |
-| `--rows N` | auto-fit | price bins shown (auto-fits to book depth unless set) |
+| `--rows N` | auto | price bins shown (default: an auto price band ≈0.15% of price; override to pin a height) |
 | `--cols N` | `240` | number of time columns (history width) |
 | `--no-trades` | off | hide the trades layer (book only) |
 | `--no-micro` | off | disable wall/iceberg/pull detection overlays |
 | `--raw` | off | dump one raw book frame then continue |
+| `--diag` | off | print live book + level-one + heatmap stats (for diagnosing) |
+
+### Keyboard controls (in the window)
+
+| Key | Action |
+|-----|--------|
+| `+` / `−` | zoom the price band in / out (clears the heatmap; it refills over a few seconds) |
+| `m` | toggle the wall/iceberg/pull overlays |
+| `n` / `p` | cycle the watchlist (live mode) |
 
 ### What you see
 
 - **Heatmap** — resting size at each price (brighter = more liquidity); walls show as
-  bright horizontal streaks, pulls as streaks that suddenly go dark.
+  bright horizontal streaks, pulls as streaks that suddenly go dark. Color uses a
+  power-law scale (small sizes stay visible on thin books). The visible price band is a
+  fixed window centered on the touch — `+`/`−` zoom it; equity books are sparse, so expect
+  ~10–15 streaks near the price, not a dense wall.
 - **Cyan line** — mid price over time. The y-axis auto-recenters as price drifts.
-- **Bubbles** — trade prints, area in proportion to size, green = buyer-initiated (lifted
-  the offer), red = seller-initiated (hit the bid). See the caveat below.
+- **Bubbles** — trade prints; area scales with size *relative to the recent typical print*
+  (so small-lot names still show variation). Green = buyer-initiated (lifted the offer),
+  red = seller-initiated (hit the bid), gray = ambiguous. See the caveat below.
 - **CVD panel** — cumulative volume delta (running Σ of signed trade size).
 - **Wall / iceberg / pull overlays** (Phase 5C) — `◄` marks a persistent **wall** (large,
   long-resting level; green=bid, red=ask, brighter=more persistent), `◆` a likely

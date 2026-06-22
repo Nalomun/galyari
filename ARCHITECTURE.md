@@ -137,8 +137,13 @@ reset on a hot switch (`analyzer.reset()` + cleared overlays). Detection is tune
 - **matplotlib** is fine as a seed renderer but not ideal for a high-FPS scrolling
   heatmap; a web/canvas frontend is the eventual path (Phase 5, propose-only).
 - **Single symbol** per process.
-- Color autoscaling is per-frame on `matrix.max()`; a persistent percentile scale would be
-  steadier but this is good enough and adapts to regime changes.
+- Color uses `PowerNorm(gamma≈0.45)` with a per-frame 97th-percentile `vmax`, so small
+  resting sizes stay visible on heavy-tailed, thin equity books while walls still pop.
+- The visible price band is a fixed window (~0.15% of price each side) centered on the
+  touch, not a fit to full book depth — equity books are sparse and wide, so fitting the
+  furthest level buries the action. `+`/`−` adjust it. The image extent and axes y-limits
+  are re-locked to the current row count every frame (they must track `n_rows` or the
+  heatmap, mid line and bubbles fall into mismatched coordinate systems).
 - The per-venue breakdown of each level is parsed and available on `Level` but not yet
   visualized.
 

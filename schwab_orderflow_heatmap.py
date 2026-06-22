@@ -354,7 +354,7 @@ def main():
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")
     ap.add_argument("--tick", type=float, default=0.01, help="price bin size ($)")
     ap.add_argument("--rows", type=int, default=None,
-                    help="price bins shown (default: auto-fit to book depth)")
+                    help="price bins shown (default: auto price band ~0.15%% of price)")
     ap.add_argument("--cols", type=int, default=240, help="time columns (history)")
     ap.add_argument("--no-trades", action="store_true", help="hide trades layer")
     ap.add_argument("--no-micro", action="store_true",
