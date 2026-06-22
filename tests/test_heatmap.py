@@ -63,6 +63,37 @@ def test_cvd_integrates_signed_size():
     assert hm.cvd_hist[-1] == 200
 
 
+def test_autofit_matrix_shape_matches_nrows():
+    # the matrix row count must equal n_rows after autofit, or the renderer's
+    # ylim/extent (driven by n_rows) won't match the image — the alignment bug.
+    hm = Heatmap(n_cols=20, tick=0.01, autofit=True)
+    hm.push(book_at(300.0, levels=20), [])
+    assert hm.matrix.shape == (hm.n_rows, hm.n_cols)
+    assert 60 <= hm.n_rows <= 240
+
+
+def test_set_zoom_reallocates_and_keeps_center():
+    hm = Heatmap(n_cols=20, tick=0.01, autofit=True)
+    hm.push(book_at(100.0), [])
+    r0 = hm.n_rows
+    center0 = hm.row0_price + (hm.n_rows // 2) * hm.tick
+    hm.set_zoom(int(r0 * 1.5))
+    assert hm.matrix.shape == (hm.n_rows, hm.n_cols)
+    assert hm.n_rows != r0
+    center1 = hm.row0_price + (hm.n_rows // 2) * hm.tick
+    assert abs(center1 - center0) < hm.tick * 1.5          # center preserved
+    assert hm.autofit is False                             # manual zoom pins it
+
+
+def test_set_zoom_clamped():
+    hm = Heatmap(n_cols=20, tick=0.01, autofit=False, n_rows=120)
+    hm.push(book_at(100.0), [])
+    hm.set_zoom(5)
+    assert hm.n_rows == 30 and hm.matrix.shape[0] == 30    # min clamp
+    hm.set_zoom(9999)
+    assert hm.n_rows == 600 and hm.matrix.shape[0] == 600  # max clamp
+
+
 def test_imbalance_sign():
     hm = Heatmap(n_cols=5, autofit=False, n_rows=120)
     heavy_bid = Book("SIM", 0,

@@ -323,7 +323,25 @@ def build_figure(hm: Heatmap, title: str):
     cbar.ax.yaxis.set_tick_params(color=FG)
     plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color=FG)
 
+    _silence_resize_widget_bug(fig)
     return fig, ax, ax_cvd, im, mid_ln, scat, cvd_ln, header, overlays
+
+
+def _silence_resize_widget_bug(fig):
+    """Swallow only the known-harmless matplotlib widget bug where a ResizeEvent
+    reaches a handler expecting `.inaxes` (TextBox on window resize). Everything
+    else is passed through to the normal printer."""
+    cb = fig.canvas.callbacks
+    prev = getattr(cb, "exception_handler", None)
+
+    def handler(exc):
+        if isinstance(exc, AttributeError) and "inaxes" in str(exc):
+            return
+        if prev is not None:
+            return prev(exc)
+        raise exc
+
+    cb.exception_handler = handler
 
 
 def main():
@@ -436,6 +454,12 @@ def main():
 
         hm.push(book, trades, micro.pulls if micro else ())
         im.set_data(hm.matrix)
+        # CRITICAL: keep the image extent and axes y-limits locked to the current
+        # row count. n_rows changes on autofit and on +/- zoom; if these aren't
+        # updated, the heatmap, mid line and bubbles end up in different coordinate
+        # systems (heatmap stretched/clipped, everything misaligned).
+        im.set_extent((-0.5, hm.n_cols - 0.5, -0.5, hm.n_rows - 0.5))
+        ax.set_ylim(-0.5, hm.n_rows - 0.5)
 
         # color scale: high percentile of nonzero cells as vmax (PowerNorm keeps its
         # gamma). p97 over the whole matrix so a single wall doesn't crush the rest.
