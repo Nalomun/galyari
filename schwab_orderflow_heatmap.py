@@ -1,270 +1,340 @@
 #!/usr/bin/env python3
+"""Bookmap-style order-flow heatmap off the Schwab NASDAQ_BOOK stream.
+
+Modes:
+  --simulate            synthetic book + trades, no Schwab needed (start here)
+  --replay FILE         play back a recorded JSONL tape
+  (default)             live Schwab NASDAQ_BOOK + TIMESALE_EQUITY via schwab-py
+
+The data layer (orderbook.py / state.py / feeds.py / recorder.py) is matplotlib-free
+and reusable; this file is just the CLI + renderer. See ARCHITECTURE.md.
 """
-Minimal Bookmap-style order-flow heatmap off the Schwab NASDAQ_BOOK stream.
 
-Two modes:
-  --simulate            synthetic order book, no Schwab needed (run this first)
-  (default)             live Schwab nasdaq_book feed via schwab-py
-
-This is a SEED, not a finished app. It solves the Schwab-specific part
-(book message -> rolling time x price liquidity matrix) and renders it with
-matplotlib so you can see it work in one file. Hand it to Claude Code to grow
-into the real thing (trade bubbles, CVD, web/canvas renderer, recording, etc).
-
-Deps:  pip install matplotlib numpy schwab-py
-Run:   python schwab_orderflow_heatmap.py --simulate
-       python schwab_orderflow_heatmap.py --symbol GOOG
-"""
+from __future__ import annotations
 
 import argparse
-import asyncio
-import random
 import os
 import threading
-import time
-from collections import namedtuple
+from collections import deque
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import animation
+from matplotlib import gridspec
 
-# Load .env if python-dotenv is installed (pip install python-dotenv).
-# Falls back to plain os.environ / CLI args if it isn't.
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# --- Shared latest-book state -------------------------------------------------
-# Both the Schwab thread and the simulate thread write here; the matplotlib
-# main loop reads it. A single dict under a lock is plenty for a demo.
-Book = namedtuple("Book", ["bids", "asks", "ts"])  # bids/asks: list[(price, volume)]
-_state = {"book": None}
-_lock = threading.Lock()
+import state
+import feeds
+import recorder as rec_mod
 
 
-def set_book(bids, asks):
-    with _lock:
-        _state["book"] = Book(bids=bids, asks=asks, ts=time.time())
+# --- Palette -----------------------------------------------------------------
+BG = "#0e1117"
+PANEL = "#0e1117"
+FG = "#c9d1d9"
+GRID = "#2d333b"
+MID = "#39d0ff"
+BUY = "#3fb950"
+SELL = "#f85149"
+NEUTRAL = "#8b949e"
 
 
-def get_book():
-    with _lock:
-        return _state["book"]
-
-
-# --- Schwab NASDAQ_BOOK parsing ----------------------------------------------
-# schwab-py relabels the raw numeric fields. These constants reflect the
-# documented labels; if your messages differ, run with --raw to print one
-# frame and adjust the four names below. Each side is a list of price levels,
-# each level carrying a TOTAL_VOLUME aggregated across market makers.
-BIDS_KEY, ASKS_KEY = "BIDS", "ASKS"
-BID_PRICE_KEY, ASK_PRICE_KEY = "BID_PRICE", "ASK_PRICE"
-VOLUME_KEY = "TOTAL_VOLUME"
-
-
-def parse_book_message(msg, dump=False):
-    """schwab-py book msg -> (bids, asks) as lists of (price, volume)."""
-    content = msg.get("content", [])
-    if not content:
-        return
-    entry = content[0]
-    if dump:
-        import json
-        print(json.dumps(entry, indent=2)[:2000])
-    bids = [(lvl[BID_PRICE_KEY], lvl[VOLUME_KEY]) for lvl in entry.get(BIDS_KEY, [])]
-    asks = [(lvl[ASK_PRICE_KEY], lvl[VOLUME_KEY]) for lvl in entry.get(ASKS_KEY, [])]
-    if bids or asks:
-        if not getattr(parse_book_message, "_seen", False):
-            parse_book_message._seen = True
-            print("[schwab] first book frame received \u2014 data is flowing.",
-                  flush=True)
-        set_book(bids, asks)
-
-
-def make_stream(api_key, app_secret, callback_url, token_path, account_id):
-    """Manual-flow auth on the MAIN thread (you paste the redirect URL).
-    Returns a StreamClient; call run_stream() on a bg thread."""
-    from schwab.auth import client_from_manual_flow
-    from schwab.streaming import StreamClient
-
-    # Manual flow: prints an auth URL, then waits for you to paste the full
-    # redirect URL from the browser address bar. The redirect page will look
-    # broken/unreachable (nothing is listening on the callback) -- that's fine,
-    # the code is in the URL. Copy the WHOLE https://127.0.0.1:8182/?code=... string.
-    client = client_from_manual_flow(
-        api_key=api_key, app_secret=app_secret,
-        callback_url=callback_url, token_path=token_path)
-    print(f"[schwab] token written to {token_path}", flush=True)
-    return StreamClient(client, account_id=account_id)
-
-
-def run_stream(stream, symbol, raw=False):
-    """asyncio stream loop; intended to run on a background thread."""
-    async def go():
-        await stream.login()
-        print(f"[schwab] logged in; subscribing to NASDAQ_BOOK for {symbol} ...",
-              flush=True)
-        # add handler BEFORE subscribing: book data starts flowing immediately
-        stream.add_nasdaq_book_handler(lambda m: parse_book_message(m, dump=raw))
-        await stream.nasdaq_book_subs([symbol])
-        print("[schwab] subscribed, waiting for book frames. "
-              "Silence here = market closed (regular session ~9:30-16:00 ET) "
-              "or no L2 entitlement.", flush=True)
-        while True:
-            await stream.handle_message()
-
-    asyncio.run(go())
-
-
-# --- Synthetic feed (no Schwab needed) ---------------------------------------
-def run_simulate(tick=0.01, levels=40):
-    mid = 100.0
-    walls = {}  # price -> persistent big resting size, decays
-    while True:
-        mid += random.gauss(0, tick * 1.5)
-        mid = round(mid / tick) * tick
-        # occasionally drop a liquidity wall
-        if random.random() < 0.05:
-            side = random.choice([-1, 1])
-            wprice = round((mid + side * random.randint(3, 15) * tick) / tick) * tick
-            walls[wprice] = random.randint(3000, 12000)
-        for p in list(walls):  # decay
-            walls[p] *= 0.97
-            if walls[p] < 200:
-                del walls[p]
-
-        def level_vol(price):
-            base = random.randint(100, 1500)
-            return base + int(walls.get(round(price / tick) * tick, 0))
-
-        bids = [(round(mid - i * tick, 4), level_vol(mid - i * tick))
-                for i in range(1, levels + 1)]
-        asks = [(round(mid + i * tick, 4), level_vol(mid + i * tick))
-                for i in range(1, levels + 1)]
-        set_book(bids, asks)
-        time.sleep(0.25)
-
-
-# --- Rolling heatmap ----------------------------------------------------------
+# --- Rolling heatmap with vertical recentering -------------------------------
 class Heatmap:
-    """Fixed price window anchored on first mid. Recentering/auto-zoom is a
-    Claude Code expansion item; for a short session this is fine."""
+    """Rolling price×time liquidity matrix.
 
-    def __init__(self, n_cols=240, half_levels=60, tick=0.01):
+    Rows are absolute-price-keyed via `row0_price` (price of row 0). When the mid
+    drifts out of a central dead-zone the rows are rolled to recenter, so the
+    y-axis follows price without clipping or corrupting history. Trades and the
+    mid line are stored in *absolute price* and projected to rows at draw time, so
+    recentering never misaligns them.
+    """
+
+    def __init__(self, n_cols=240, n_rows=120, tick=0.01, autofit=True):
         self.n_cols = n_cols
-        self.half_levels = half_levels
+        self.n_rows = n_rows
         self.tick = tick
-        self.n_bins = 2 * half_levels + 1
-        self.matrix = np.zeros((self.n_bins, n_cols))
-        self.center = None
-        self.bin_prices = None
-        self.mid_line = np.full(n_cols, np.nan)
+        self.autofit = autofit
+        self.matrix = np.zeros((n_rows, n_cols))
+        self.row0_price: float | None = None
+        self.mid_hist = np.full(n_cols, np.nan)      # absolute mid price per column
+        self.cvd_hist = np.full(n_cols, np.nan)      # cumulative volume delta per column
+        self.cvd = 0.0
+        self.trades: deque[dict] = deque()           # {col, price, size, side}
+        self._fitted = False
+        self.last_book = None
 
-    def _anchor(self, mid):
-        self.center = round(mid / self.tick) * self.tick
-        offs = (np.arange(self.n_bins) - self.half_levels) * self.tick
-        self.bin_prices = self.center + offs  # ascending price by row
+    # --- price/row mapping ---
+    def _row(self, price: float) -> int:
+        return int(round((price - self.row0_price) / self.tick))
 
-    def _bin_index(self, price):
-        idx = int(round((price - self.center) / self.tick)) + self.half_levels
-        return idx if 0 <= idx < self.n_bins else None
+    def row_prices(self) -> np.ndarray:
+        return self.row0_price + np.arange(self.n_rows) * self.tick
 
-    def push(self, book):
-        if book is None:
+    def _set_center(self, mid: float) -> None:
+        center = round(mid / self.tick) * self.tick
+        self.row0_price = center - (self.n_rows // 2) * self.tick
+
+    def _maybe_autofit(self, book) -> None:
+        """One-time zoom: size the price band to the opening book depth + margin."""
+        if self._fitted or not self.autofit or book is None:
             return
-        mid = None
-        if book.bids and book.asks:
-            mid = (book.bids[0][0] + book.asks[0][0]) / 2
-        if self.center is None and mid is not None:
-            self._anchor(mid)
-        if self.center is None:
+        mid = book.mid
+        if mid is None:
             return
-        col = np.zeros(self.n_bins)
-        for price, vol in book.bids + book.asks:
-            i = self._bin_index(price)
-            if i is not None:
-                col[i] += vol
+        prices = [p for p, _ in book.levels()]
+        if len(prices) >= 4:
+            depth = max(max(prices) - mid, mid - min(prices))
+            want = int(depth / self.tick * 2.6)               # 1.3× depth each side
+            self.n_rows = int(np.clip(want, 60, 400))
+            self.matrix = np.zeros((self.n_rows, self.n_cols))
+        self._set_center(mid)
+        self._fitted = True
+
+    def _recenter(self, mid: float) -> None:
+        target = self.n_rows / 2.0
+        row = (mid - self.row0_price) / self.tick
+        if abs(row - target) <= self.n_rows * 0.30:           # inside dead-zone
+            return
+        shift = int(round(target - row))
+        if shift == 0:
+            return
+        self.matrix = np.roll(self.matrix, shift, axis=0)
+        if shift > 0:
+            self.matrix[:shift, :] = 0
+        else:
+            self.matrix[shift:, :] = 0
+        self.row0_price -= shift * self.tick
+
+    def push(self, book, new_trades) -> None:
+        """Advance one time column. Always scrolls so time stays honest."""
+        self.last_book = book
+        mid = book.mid if book is not None else None
+
+        if self.row0_price is None:
+            if mid is None:
+                return
+            self._maybe_autofit(book)
+            if self.row0_price is None:               # autofit disabled → center now
+                self._set_center(mid)
+
+        if mid is not None:
+            self._recenter(mid)
+
+        # build the new rightmost column from the current book
+        col = np.zeros(self.n_rows)
+        if book is not None and self.row0_price is not None:
+            for price, vol in book.levels():
+                r = self._row(price)
+                if 0 <= r < self.n_rows:
+                    col[r] += vol
+
         self.matrix = np.roll(self.matrix, -1, axis=1)
         self.matrix[:, -1] = col
-        self.mid_line = np.roll(self.mid_line, -1)
-        self.mid_line[-1] = mid if mid is not None else np.nan
+
+        self.mid_hist = np.roll(self.mid_hist, -1)
+        self.mid_hist[-1] = mid if mid is not None else np.nan
+
+        # age existing trades one column; drop those scrolled off-screen
+        for t in self.trades:
+            t["col"] -= 1
+        while self.trades and self.trades[0]["col"] < 0:
+            self.trades.popleft()
+
+        # ingest fresh prints at the rightmost column; integrate CVD
+        for tr in new_trades:
+            self.trades.append({"col": self.n_cols - 1, "price": tr.price,
+                                "size": tr.size, "side": tr.side})
+            self.cvd += tr.side * tr.size
+        self.cvd_hist = np.roll(self.cvd_hist, -1)
+        self.cvd_hist[-1] = self.cvd
+
+    # --- readouts ---
+    def imbalance(self) -> float | None:
+        b = self.last_book
+        if b is None or not b.bids or not b.asks:
+            return None
+        bv = sum(l.volume for l in b.bids)
+        av = sum(l.volume for l in b.asks)
+        tot = bv + av
+        return (bv - av) / tot if tot else None
+
+
+def _trade_xyc(hm: Heatmap):
+    """Project buffered trades to (x cols, y rows, sizes, colors)."""
+    xs, ys, ss, cs = [], [], [], []
+    for t in hm.trades:
+        r = (t["price"] - hm.row0_price) / hm.tick
+        if not (0 <= r < hm.n_rows):
+            continue
+        xs.append(t["col"])
+        ys.append(r)
+        ss.append(8 + 42 * np.sqrt(t["size"] / 1000.0))      # area ∝ size
+        cs.append(BUY if t["side"] > 0 else SELL if t["side"] < 0 else NEUTRAL)
+    return xs, ys, ss, cs
+
+
+def build_figure(hm: Heatmap, title: str):
+    plt.rcParams.update({
+        "figure.facecolor": BG, "axes.facecolor": PANEL,
+        "text.color": FG, "axes.labelcolor": FG,
+        "xtick.color": FG, "ytick.color": FG,
+        "axes.edgecolor": GRID, "font.family": "monospace",
+    })
+    fig = plt.figure(figsize=(12, 7))
+    fig.canvas.manager.set_window_title(f"ovultor — {title}")
+    gs = gridspec.GridSpec(2, 1, height_ratios=[4, 1], hspace=0.06,
+                           left=0.07, right=0.99, top=0.92, bottom=0.07)
+    ax = fig.add_subplot(gs[0])
+    ax_cvd = fig.add_subplot(gs[1], sharex=ax)
+
+    im = ax.imshow(hm.matrix, aspect="auto", origin="lower", cmap="inferno",
+                   interpolation="nearest", animated=True)
+    (mid_ln,) = ax.plot([], [], color=MID, lw=1.1, alpha=0.9, zorder=4)
+    scat = ax.scatter([], [], s=[], c=[], edgecolors="none", alpha=0.85, zorder=5)
+    ax.set_ylabel("price")
+    ax.tick_params(labelbottom=False)
+    ax.grid(True, axis="y", color=GRID, lw=0.4, alpha=0.4)
+
+    header = ax.text(0.008, 1.02, "", transform=ax.transAxes, va="bottom",
+                     ha="left", fontsize=10.5, color=FG)
+
+    (cvd_ln,) = ax_cvd.plot([], [], color=NEUTRAL, lw=1.2)
+    ax_cvd.axhline(0, color=GRID, lw=0.6)
+    ax_cvd.set_ylabel("CVD")
+    ax_cvd.set_xlabel("time →")
+    ax_cvd.set_xlim(0, hm.n_cols - 1)
+    ax_cvd.grid(True, color=GRID, lw=0.4, alpha=0.4)
+
+    cbar = fig.colorbar(im, ax=[ax, ax_cvd], pad=0.012, fraction=0.035)
+    cbar.set_label("resting size", color=FG)
+    cbar.ax.yaxis.set_tick_params(color=FG)
+    plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color=FG)
+
+    return fig, ax, ax_cvd, im, mid_ln, scat, cvd_ln, header
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Order-flow / liquidity heatmap.")
     ap.add_argument("--symbol", default=os.environ.get("SCHWAB_SYMBOL", "GOOG"))
-    ap.add_argument("--simulate", action="store_true")
-    ap.add_argument("--tick", type=float, default=0.01)
-    ap.add_argument("--half-levels", type=int, default=60)
-    ap.add_argument("--cols", type=int, default=240)
-    ap.add_argument("--raw", action="store_true", help="dump one book frame and continue")
-    # Schwab creds: default to env vars (from .env), CLI args override them.
+    ap.add_argument("--simulate", action="store_true", help="synthetic feed, no creds")
+    ap.add_argument("--replay", metavar="FILE", help="play back a recorded JSONL tape")
+    ap.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")
+    ap.add_argument("--tick", type=float, default=0.01, help="price bin size ($)")
+    ap.add_argument("--rows", type=int, default=None,
+                    help="price bins shown (default: auto-fit to book depth)")
+    ap.add_argument("--cols", type=int, default=240, help="time columns (history)")
+    ap.add_argument("--no-trades", action="store_true", help="hide trades layer")
+    ap.add_argument("--record", action="store_true", help="record frames to recordings/")
+    ap.add_argument("--raw", action="store_true", help="dump one book frame then continue")
+    # creds (env from .env; CLI overrides)
     ap.add_argument("--api-key", default=os.environ.get("SCHWAB_API_KEY"))
     ap.add_argument("--app-secret", default=os.environ.get("SCHWAB_APP_SECRET"))
-    # MUST match the callback URL registered in your Schwab developer app,
-    # character for character (including any trailing slash).
     ap.add_argument("--callback-url",
-                    default=os.environ.get("SCHWAB_CALLBACK_URL",
-                                           "https://127.0.0.1:8182/"))
-    ap.add_argument("--token-path",
-                    default=os.environ.get("SCHWAB_TOKEN_PATH", "token.json"))
+                    default=os.environ.get("SCHWAB_CALLBACK_URL", "https://127.0.0.1:8182/"))
+    ap.add_argument("--token-path", default=os.environ.get("SCHWAB_TOKEN_PATH", "token.json"))
     ap.add_argument("--account-id", type=int,
                     default=(int(os.environ["SCHWAB_ACCOUNT_ID"])
                              if os.environ.get("SCHWAB_ACCOUNT_ID") else None))
     args = ap.parse_args()
 
-    if args.simulate:
-        t = threading.Thread(target=run_simulate,
-                             args=(args.tick, args.half_levels), daemon=True)
+    autofit = args.rows is None
+    n_rows = args.rows if args.rows else 120
+
+    recorder = None
+    if args.replay:
+        title = f"REPLAY {os.path.basename(args.replay)}"
+        t = threading.Thread(target=feeds.run_replay,
+                             args=(args.replay, args.speed), daemon=True)
+    elif args.simulate:
+        title = "SIM"
+        if args.record:
+            recorder = rec_mod.Recorder(rec_mod.default_path("SIM", 0))
+        t = threading.Thread(
+            target=feeds.run_simulate,
+            kwargs=dict(tick=args.tick, with_trades=not args.no_trades,
+                        recorder=recorder), daemon=True)
     else:
         missing = [k for k in ("api_key", "app_secret", "account_id")
                    if getattr(args, k) is None]
         if missing:
             ap.error(f"live mode needs: {', '.join(missing)} (or use --simulate)")
-        # Auth happens here on the main thread so you can paste the redirect URL
-        # cleanly before the plot window opens.
-        stream = make_stream(args.api_key, args.app_secret, args.callback_url,
-                             args.token_path, args.account_id)
-        t = threading.Thread(target=run_stream,
-                             args=(stream, args.symbol, args.raw), daemon=True)
+        title = args.symbol
+        stream = feeds.make_stream(args.api_key, args.app_secret, args.callback_url,
+                                   args.token_path, args.account_id)
+        if args.record:
+            import time as _t
+            recorder = rec_mod.Recorder(
+                rec_mod.default_path(args.symbol, int(_t.time() * 1000)))
+        t = threading.Thread(
+            target=feeds.run_schwab_stream,
+            kwargs=dict(stream=stream, symbol=args.symbol, raw=args.raw,
+                        trades=not args.no_trades, recorder=recorder), daemon=True)
     t.start()
 
-    hm = Heatmap(n_cols=args.cols, half_levels=args.half_levels, tick=args.tick)
-
-    fig, ax = plt.subplots(figsize=(11, 6))
-    fig.canvas.manager.set_window_title(
-        f"Order Flow — {'SIM' if args.simulate else args.symbol}")
-    im = ax.imshow(hm.matrix, aspect="auto", origin="lower",
-                   cmap="inferno", interpolation="nearest")
-    (mid_ln,) = ax.plot([], [], color="cyan", lw=1.0, alpha=0.8)
-    ax.set_xlabel("time \u2192")
-    ax.set_ylabel("price")
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("resting size")
+    hm = Heatmap(n_cols=args.cols, n_rows=n_rows, tick=args.tick, autofit=autofit)
+    fig, ax, ax_cvd, im, mid_ln, scat, cvd_ln, header = build_figure(hm, title)
 
     def update(_):
-        hm.push(get_book())
+        trades = [] if args.no_trades else state.drain_trades()
+        hm.push(state.get_book(), trades)
         im.set_data(hm.matrix)
-        m = hm.matrix.max()
-        if m > 0:
-            im.set_clim(0, m)
-        if hm.center is not None:
-            ax.set_yticks(np.linspace(0, hm.n_bins - 1, 7))
-            ax.set_yticklabels(
-                [f"{p:.2f}" for p in np.linspace(
-                    hm.bin_prices[0], hm.bin_prices[-1], 7)])
-            # map mid price -> row index for the cyan line
-            rows = [((p - hm.center) / hm.tick) + hm.half_levels
-                    if not np.isnan(p) else np.nan for p in hm.mid_line]
-            mid_ln.set_data(np.arange(hm.n_cols), rows)
-        return [im, mid_ln]
+
+        # steady color scaling: 99th percentile of nonzero cells
+        nz = hm.matrix[hm.matrix > 0]
+        if nz.size:
+            im.set_clim(0, np.percentile(nz, 99))
+
+        x = np.arange(hm.n_cols)
+        if hm.row0_price is not None:
+            rp = hm.row_prices()
+            yt = np.linspace(0, hm.n_rows - 1, 7)
+            ax.set_yticks(yt)
+            ax.set_yticklabels([f"{p:7.2f}" for p in
+                                np.interp(yt, [0, hm.n_rows - 1], [rp[0], rp[-1]])])
+            rows = (hm.mid_hist - hm.row0_price) / hm.tick
+            mid_ln.set_data(x, np.where(np.isnan(hm.mid_hist), np.nan, rows))
+
+            if not args.no_trades:
+                xs, ys, ss, cs = _trade_xyc(hm)
+                scat.set_offsets(np.c_[xs, ys] if xs else np.empty((0, 2)))
+                scat.set_sizes(ss if ss else [])
+                scat.set_color(cs if cs else [])
+
+        if np.isfinite(hm.cvd_hist).any():
+            cvd_ln.set_data(x, hm.cvd_hist)
+            lo, hi = np.nanmin(hm.cvd_hist), np.nanmax(hm.cvd_hist)
+            pad = max(50.0, (hi - lo) * 0.1)
+            ax_cvd.set_ylim(lo - pad, hi + pad)
+            cvd_ln.set_color(BUY if hm.cvd >= 0 else SELL)
+
+        header.set_text(_header_text(hm, title))
+        return [im, mid_ln, scat, cvd_ln, header]
 
     _ = animation.FuncAnimation(fig, update, interval=300, blit=False,
                                 cache_frame_data=False)
-    plt.tight_layout()
-    plt.show()
+    try:
+        plt.show()
+    finally:
+        if recorder is not None:
+            recorder.close()
+
+
+def _header_text(hm: Heatmap, title: str) -> str:
+    b = hm.last_book
+    if b is None or b.mid is None:
+        return f"{title}   waiting for book…  (market closed / no entitlement → use --simulate)"
+    imb = hm.imbalance()
+    imb_s = f"{imb:+.2f}" if imb is not None else "  —"
+    spr = b.spread
+    spr_s = f"{spr:.2f}" if spr is not None else "—"
+    return (f"{title}   mid {b.mid:.2f}   spread {spr_s}   "
+            f"imbalance {imb_s}   CVD {hm.cvd:+,.0f}")
 
 
 if __name__ == "__main__":

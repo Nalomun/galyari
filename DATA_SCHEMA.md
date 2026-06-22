@@ -115,9 +115,23 @@ class Book:
 (valid, not an error). `OrderBook` is a thin stateful holder whose `apply(msg)` parses and
 replaces its current `Book` (full-replace, per the finding above).
 
-### Trades (`TIMESALE_EQUITY`)
+### Trades (derived from `LEVEL_ONE_EQUITY`)
 
-The trades layer parses Schwab's `TIMESALE_EQUITY` stream into:
+**Schwab's streamer has no time-of-sale service.** The legacy TD Ameritrade
+`TIMESALE_EQUITY` stream was dropped; schwab-py 1.5.1 exposes only `level_one_equity`,
+`chart_equity`, and the book services. So live prints are **derived from
+`LEVEL_ONE_EQUITY`**: each message is a field-delta, and we emit a `Trade` when the
+last-trade fields advance.
+
+| Field (relabeled) | Use |
+|-------------------|-----|
+| `LAST_PRICE` | print price |
+| `LAST_SIZE` | print size |
+| `TRADE_TIME_MILLIS` | print time; a *new* print is detected when this advances |
+
+Because level-one is a delta feed (a field appears only when it changes), the producer
+caches the last-known `(trade_ms, price, size)` per symbol and emits a print when the
+timestamp moves or the price/size pair changes.
 
 ```python
 @dataclass(frozen=True)
@@ -130,5 +144,14 @@ class Trade:
 ```
 
 Aggressor side is inferred against the prevailing book (trade at/above best ask = buy;
-at/below best bid = sell), since the stream does not label aggressor directly. In simulate
-and replay this is synthesized/recorded so the layer is testable offline.
+at/below best bid = sell), since the feed does not label aggressor directly.
+
+> **Caveat (not live-verified):** level-one last-trade reflects the *consolidated* last
+> sale, sampled at the feed's update cadence — it is **not** a true tick-by-tick T&S tape.
+> Rapid same-price prints can coalesce, and odd-lot/auction prints may be filtered by the
+> consolidated feed. For order-flow *visualization* this is adequate; for trade-level
+> research treat CVD/bubbles as an approximation. If you later find a genuine T&S source,
+> swap `_on_level_one` for it — the `Trade` struct and everything downstream are unchanged.
+
+In simulate and replay, trades are synthesized/recorded directly so the layer is fully
+testable offline.
