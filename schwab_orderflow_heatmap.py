@@ -68,6 +68,7 @@ class Heatmap:
         self.mid_hist = np.full(n_cols, np.nan)      # absolute mid price per column
         self.cvd_hist = np.full(n_cols, np.nan)      # cumulative volume delta per column
         self.cvd = 0.0
+        self.size_ref = 100.0                        # rolling typical trade size (EMA)
         self.trades: deque[dict] = deque()           # {col, price, size, side}
         self.pull_marks: deque[dict] = deque()        # {col, price, side} — fading pull flags
         self._fitted = False
@@ -80,10 +81,25 @@ class Heatmap:
         self.mid_hist = np.full(self.n_cols, np.nan)
         self.cvd_hist = np.full(self.n_cols, np.nan)
         self.cvd = 0.0
+        self.size_ref = 100.0
         self.trades.clear()
         self.pull_marks.clear()
         self._fitted = False
         self.last_book = None
+
+    def set_zoom(self, n_rows: int) -> None:
+        """Manually set the visible price band (rows), recentering on the current
+        center. Disables autofit. Liquidity history is cleared (can't rebin); the
+        mid line, trades and CVD are price/time-keyed so they survive."""
+        n_rows = int(np.clip(n_rows, 30, 600))
+        center = (self.row0_price + (self.n_rows // 2) * self.tick
+                  if self.row0_price is not None else None)
+        self.n_rows = n_rows
+        self.matrix = np.zeros((n_rows, self.n_cols))
+        if center is not None:
+            self.row0_price = center - (n_rows // 2) * self.tick
+        self.autofit = False
+        self._fitted = True
 
     # --- price/row mapping ---
     def _row(self, price: float) -> int:
@@ -97,17 +113,23 @@ class Heatmap:
         self.row0_price = center - (self.n_rows // 2) * self.tick
 
     def _maybe_autofit(self, book) -> None:
-        """One-time zoom: size the price band to the opening book depth + margin."""
+        """One-time zoom centered on the touch.
+
+        Equity books are sparse and wide (a handful of levels, the far ones $$ away),
+        so fitting the *furthest* level scatters everything into empty space. Instead
+        size the band to the bulk of levels — the 70th percentile of level distances
+        from mid — so the dense near-touch region fills the view. Far outliers clip;
+        use +/- to zoom manually."""
         if self._fitted or not self.autofit or book is None:
             return
         mid = book.mid
         if mid is None:
             return
-        prices = [p for p, _ in book.levels()]
-        if len(prices) >= 4:
-            depth = max(max(prices) - mid, mid - min(prices))
-            want = int(depth / self.tick * 2.6)               # 1.3× depth each side
-            self.n_rows = int(np.clip(want, 60, 400))
+        dists = sorted(abs(p - mid) for p, _ in book.levels())
+        if len(dists) >= 4:
+            q = dists[int(len(dists) * 0.70)]
+            half = max(q * 1.3, 25 * self.tick)               # ≥25 ticks each side
+            self.n_rows = int(np.clip(round(2 * half / self.tick), 60, 240))
             self.matrix = np.zeros((self.n_rows, self.n_cols))
         self._set_center(mid)
         self._fitted = True
@@ -174,6 +196,7 @@ class Heatmap:
             self.trades.append({"col": self.n_cols - 1, "price": tr.price,
                                 "size": tr.size, "side": tr.side})
             self.cvd += tr.side * tr.size
+            self.size_ref = max(1.0, 0.94 * self.size_ref + 0.06 * tr.size)
         self.cvd_hist = np.roll(self.cvd_hist, -1)
         self.cvd_hist[-1] = self.cvd
 
@@ -189,7 +212,12 @@ class Heatmap:
 
 
 def _trade_xyc(hm: Heatmap):
-    """Project buffered trades to (x cols, y rows, sizes, colors)."""
+    """Project buffered trades to (x cols, y rows, sizes, colors).
+
+    Marker area scales with size *relative to the rolling typical print* (`size_ref`),
+    so a name that trades in 50-share lots still shows a usable spread between small
+    and large prints instead of a wall of identical dots."""
+    ref = max(hm.size_ref, 1.0)
     xs, ys, ss, cs = [], [], [], []
     for t in hm.trades:
         r = (t["price"] - hm.row0_price) / hm.tick
@@ -197,7 +225,7 @@ def _trade_xyc(hm: Heatmap):
             continue
         xs.append(t["col"])
         ys.append(r)
-        ss.append(8 + 42 * np.sqrt(t["size"] / 1000.0))      # area ∝ size
+        ss.append(float(np.clip(14 + 46 * np.sqrt(t["size"] / ref), 10, 340)))
         cs.append(BUY if t["side"] > 0 else SELL if t["side"] < 0 else NEUTRAL)
     return xs, ys, ss, cs
 
@@ -380,6 +408,9 @@ def main():
     if control is not None:
         _wire_switching(fig, hm, ctx, watchlist, control, overlays)
     _wire_micro_toggle(fig, ctx, overlays)
+    _wire_zoom(fig, hm)
+    fig.text(0.99, 0.013, "+ / −  zoom     m  overlays", color=NEUTRAL,
+             fontsize=8.5, ha="right", va="center")
 
     def update(_):
         book = state.get_book()
@@ -461,6 +492,18 @@ def _draw_overlays(hm, micro, overlays, show):
     pull_scat.set_offsets(np.c_[px, py] if px else np.empty((0, 2)))
     pull_scat.set_sizes([70] * len(px) if px else [])
     pull_scat.set_color([PULL] * len(px) if px else [])
+
+
+def _wire_zoom(fig, hm):
+    """+/- change the visible price band (works in every mode)."""
+    def on_key(event):
+        if event.key in ("+", "="):
+            hm.set_zoom(int(hm.n_rows / 1.3))
+            fig.canvas.draw_idle()
+        elif event.key in ("-", "_"):
+            hm.set_zoom(int(hm.n_rows * 1.3))
+            fig.canvas.draw_idle()
+    fig.canvas.mpl_connect("key_press_event", on_key)
 
 
 def _wire_micro_toggle(fig, ctx, overlays):
