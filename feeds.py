@@ -86,25 +86,82 @@ def _on_level_one(msg, recorder=None):
                 recorder.write_trade(tr)
 
 
-def run_schwab_stream(stream, symbol, raw=False, trades=True, recorder=None):
-    """asyncio stream loop; intended to run on a background thread."""
+class StreamControl:
+    """Thread-safe handle the renderer uses to retarget the live stream at runtime.
+
+    The render loop (a different thread) calls `request_switch`; the command is
+    hopped onto the stream's asyncio loop with `call_soon_threadsafe` and consumed
+    inside the message loop, so all websocket I/O stays on one task (schwab-py's
+    socket lock requires it). No-op until the loop has bound itself.
+    """
+
+    def __init__(self) -> None:
+        self._loop = None
+        self._queue = None
+
+    def _bind(self, loop, queue) -> None:
+        self._loop = loop
+        self._queue = queue
+
+    def request_switch(self, symbol: str) -> None:
+        if self._loop is None or self._queue is None:
+            return
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, ("switch", symbol))
+
+
+def run_schwab_stream(stream, symbol, raw=False, trades=True, recorder=None,
+                      control: "StreamControl | None" = None):
+    """asyncio stream loop; intended to run on a background thread.
+
+    Honors hot-switch commands posted via `control` between messages. A 0.5s poll
+    timeout on handle_message keeps switches responsive even when the book is quiet.
+    """
     async def go():
+        ctrl_q: asyncio.Queue = asyncio.Queue()
+        if control is not None:
+            control._bind(asyncio.get_running_loop(), ctrl_q)
+
         await stream.login()
+        state.set_active_symbol(symbol)
         print(f"[schwab] logged in; subscribing to NASDAQ_BOOK for {symbol} ...",
               flush=True)
         stream.add_nasdaq_book_handler(
             lambda m: (_dump(m) if raw else None) or _on_book(m, recorder))
+        stream.add_level_one_equity_handler(lambda m: _on_level_one(m, recorder))
         await stream.nasdaq_book_subs([symbol])
         if trades:
-            stream.add_level_one_equity_handler(lambda m: _on_level_one(m, recorder))
             await stream.level_one_equity_subs([symbol])
         print("[schwab] subscribed, waiting for frames. "
               "Silence here = market closed (regular session ~9:30-16:00 ET) "
               "or no L2 entitlement.", flush=True)
+
+        current = symbol
         while True:
-            await stream.handle_message()
+            if not ctrl_q.empty():
+                cmd, arg = await ctrl_q.get()
+                if cmd == "switch" and arg and arg != current:
+                    current = await _switch_symbol(stream, current, arg, trades)
+                continue
+            try:
+                await asyncio.wait_for(stream.handle_message(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
 
     asyncio.run(go())
+
+
+async def _switch_symbol(stream, old, new, trades):
+    """Unsubscribe `old`, subscribe `new`. Runs inline in the message loop (no
+    concurrent socket access). State is cleared by the renderer at request time."""
+    state.set_active_symbol(new)        # drop any in-flight old-symbol frames now
+    _last_trade.clear()                 # reset per-symbol print dedup
+    await stream.nasdaq_book_unsubs([old])
+    await stream.nasdaq_book_subs([new])
+    if trades:
+        await stream.level_one_equity_unsubs([old])
+        await stream.level_one_equity_subs([new])
+    print(f"[schwab] switched {old} -> {new}", flush=True)
+    return new
 
 
 def _dump(msg):

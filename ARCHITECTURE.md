@@ -37,6 +37,13 @@ thread and communicates only through the shared store. The render loop never blo
 network; the producer never touches matplotlib. This is the **renderer/data seam**: the
 producer side knows nothing about how (or whether) data is drawn.
 
+The one signal that flows *back* (renderer → producer) is a hot ticker switch. The
+renderer never calls schwab-py directly; it posts a command through `feeds.StreamControl`,
+which hops it onto the stream's asyncio loop via `loop.call_soon_threadsafe`. The command
+is consumed *inside* the message loop, so every websocket operation (subscribe,
+unsubscribe, receive) stays on one task — required because schwab-py guards the socket
+with a single `asyncio.Lock`. See "Hot ticker switching" below.
+
 ## The shared-state contract (`state.py`)
 
 A tiny module holding the latest `Book` and a bounded trade buffer behind one
@@ -71,7 +78,7 @@ Empty book is a **valid state**, never an error (market closed / no entitlement)
 |------|------|---------------------|
 | `orderbook.py` | **Stable core.** Typed `Book`/`Level`/`Trade`, `parse_nasdaq_book(msg)`, `OrderBook` state. Dependency-light; the seam research code imports. | No |
 | `state.py` | Thread-safe shared store between producer and renderer. | No |
-| `feeds.py` | Producers: live Schwab stream, simulator, replay reader. | No |
+| `feeds.py` | Producers: live Schwab stream, simulator, replay reader; `StreamControl` for hot switching. | No |
 | `recorder.py` | Append-only JSONL recording of raw frames. | No |
 | `schwab_orderflow_heatmap.py` | CLI entrypoint + matplotlib renderer (`Heatmap`). | Yes |
 
@@ -84,6 +91,23 @@ Manual OAuth (`client_from_manual_flow`) runs on the **main thread before the wi
 opens**, so the redirect-URL paste happens against a clean terminal. Credentials come from
 `.env` via `python-dotenv`. `token.json` (with refresh token) is written once and reused;
 schwab-py refreshes it. Both files are gitignored. No migration, no rewrite — this works.
+
+## Hot ticker switching (Phase 5A Tier 1)
+
+Live mode can retarget the subscription at runtime without a restart:
+
+- **Control path.** `n`/`p` (cycle a `--watchlist`) and the `go to ▸` text box call a
+  `do_switch(sym)` on the render thread, which (1) clears shared state and arms the
+  stale-frame guard (`state.clear_for_symbol`), (2) clears the local `Heatmap`, then
+  (3) posts `("switch", sym)` through `StreamControl`.
+- **Stream side.** The message loop polls its control queue between messages (a 0.5 s
+  `wait_for` timeout on `handle_message` keeps switches responsive when the book is quiet),
+  and on a switch runs `nasdaq_book_unsubs/subs` + `level_one_equity_unsubs/subs` *inline*
+  — never concurrently with a receive.
+- **Stale-frame guard.** `state.set_book`/`add_trade` drop any frame whose symbol ≠ the
+  active symbol. The renderer arms the guard *before* the stream resubscribes, so a
+  late book from the old symbol can't flash on the new symbol's chart. (In sim/replay the
+  active symbol is `None`, so the guard is inert and everything is accepted.)
 
 ## Known limitations
 
@@ -104,7 +128,8 @@ schwab-py refreshes it. Both files are gitignored. No migration, no rewrite — 
 | 2 | Price-window recentering / auto-zoom | done |
 | 3 | Trades layer (T&S bubbles + CVD) | done |
 | 4 | Recording & replay | done |
-| 5 | Web renderer / multi-symbol / wall detection | proposed only — see below |
+| 5A.1 | Hot ticker switching (live, no restart) | done |
+| 5 (rest) | Simultaneous multi-symbol / web renderer / wall detection | proposed — see below |
 
 ## Phase 5 proposals (need sign-off before building)
 
@@ -113,7 +138,6 @@ The data layer is already renderer-agnostic, so these are additive — none requ
 multi-symbol, **5B** web/canvas renderer, **5C** wall/iceberg detection. Full design,
 sizing, and build order are in **[PHASE5.md](PHASE5.md)**.
 
-Near-term highlight: **5A Tier 1 (hot ticker switching)** — retarget the live view to a new
-symbol at runtime (key cycle over a watchlist + a type-in box), no restart. Verified that
-schwab-py exposes the needed `nasdaq_book_unsubs` / `level_one_equity_unsubs` calls; ~half
-a day of work.
+**5A Tier 1 (hot ticker switching) is implemented** — see "Hot ticker switching" above.
+The remaining tracks (5A Tier 2 simultaneous multi-symbol, 5B web renderer, 5C
+wall/iceberg detection) are still proposals.

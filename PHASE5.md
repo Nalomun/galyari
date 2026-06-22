@@ -18,9 +18,15 @@ Today: one symbol per process; changing symbol means restarting with `--symbol`.
 the highest-value Phase 5 item for day-to-day use and splits into two tiers. **Do Tier 1
 first** — it's small and delivers the "switch easily" need on its own.
 
-### Tier 1 — Hot ticker switching (single view, ~half a day)
+### Tier 1 — Hot ticker switching (single view) — ✅ IMPLEMENTED
 
 Keep the single heatmap; let the subscribed symbol change at runtime, no restart.
+
+> **Status: built.** `n`/`p` cycle a `--watchlist`; the `go to ▸` box jumps to any symbol.
+> `feeds.StreamControl` hops commands onto the stream loop (`call_soon_threadsafe`); the
+> loop resubscribes inline with a 0.5 s poll so quiet markets stay responsive; a
+> `state` active-symbol guard drops stale frames from the old symbol. Tested in
+> `tests/test_switching.py`. The design notes below are kept for reference.
 
 **What changes**
 
@@ -148,7 +154,7 @@ research deliverable independent of 5A/5B.
 
 ## Suggested order
 
-1. **5A Tier 1 (hot switching)** — small, immediate daily-use win.
+1. ~~**5A Tier 1 (hot switching)**~~ — ✅ done.
 2. **5C (wall/iceberg)** — self-contained, offline-testable, research value; can run in
    parallel with anything.
 3. **5B + 5A Tier 2 together** — the web renderer is the right home for simultaneous

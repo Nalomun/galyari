@@ -77,6 +77,28 @@ page will look broken/unreachable — that's expected, nothing is listening on t
 callback; the authorization code is in the URL. A `token.json` is written and reused
 afterward.
 
+> **Reauth cadence:** the access token (30 min) refreshes automatically and silently;
+> the **refresh token lasts ~7 days** and is not rolled forward, so you only redo the
+> paste-the-URL flow about **once a week**. In between, start/stop freely with no auth
+> interaction as long as `token.json` is under 7 days old.
+
+### Switch symbols live (no restart)
+
+In live mode you can retarget the view on the fly:
+
+```bash
+python schwab_orderflow_heatmap.py --symbol AAPL --watchlist AAPL,GOOG,TSLA,NVDA
+```
+
+- **`n` / `p`** — cycle forward/back through the watchlist.
+- **`go to ▸` box** (top-right) — type any symbol + `Enter` to jump there (it's added to
+  the watchlist).
+
+The heatmap clears and re-auto-fits on the new symbol; a guard drops any late frames from
+the previous symbol so nothing stale flashes. (Single symbol per process still — this
+switches *which* one; simultaneous multi-symbol is Phase 5 Tier 2.) `--watchlist` can also
+come from `SCHWAB_WATCHLIST` in `.env`.
+
 ### Record & replay
 
 ```bash
@@ -99,6 +121,7 @@ renderer is identical across all three modes.
 | `--speed X` | `1.0` | replay speed multiplier |
 | `--record` | off | append frames to `recordings/` |
 | `--symbol SYM` | `$SCHWAB_SYMBOL` or `GOOG` | symbol to subscribe |
+| `--watchlist A,B,C` | `$SCHWAB_WATCHLIST` | symbols to cycle with `n`/`p` (live) |
 | `--tick T` | `0.01` | price bin size (dollars) |
 | `--rows N` | auto-fit | price bins shown (auto-fits to book depth unless set) |
 | `--cols N` | `240` | number of time columns (history width) |
@@ -140,5 +163,7 @@ bug, and an empty book is never treated as an error. Use `--simulate` any time.
 ## Status
 
 See [ARCHITECTURE.md](ARCHITECTURE.md#roadmap) for the phase roadmap. Implemented:
-parsing/book-state core, recentering auto-zoom heatmap, trades layer (T&S bubbles + CVD),
-and record/replay.
+parsing/book-state core, recentering auto-zoom heatmap, trades layer (bubbles + CVD),
+record/replay, and live hot ticker-switching (Phase 5A Tier 1). Remaining Phase 5
+(simultaneous multi-symbol, web renderer, wall/iceberg detection) is designed in
+[PHASE5.md](PHASE5.md) and awaiting sign-off.

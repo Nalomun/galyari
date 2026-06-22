@@ -69,6 +69,17 @@ class Heatmap:
         self._fitted = False
         self.last_book = None
 
+    def reset(self) -> None:
+        """Clear all view history — used on a hot ticker switch."""
+        self.matrix = np.zeros((self.n_rows, self.n_cols))
+        self.row0_price = None
+        self.mid_hist = np.full(self.n_cols, np.nan)
+        self.cvd_hist = np.full(self.n_cols, np.nan)
+        self.cvd = 0.0
+        self.trades.clear()
+        self._fitted = False
+        self.last_book = None
+
     # --- price/row mapping ---
     def _row(self, price: float) -> int:
         return int(round((price - self.row0_price) / self.tick))
@@ -222,6 +233,8 @@ def build_figure(hm: Heatmap, title: str):
 def main():
     ap = argparse.ArgumentParser(description="Order-flow / liquidity heatmap.")
     ap.add_argument("--symbol", default=os.environ.get("SCHWAB_SYMBOL", "GOOG"))
+    ap.add_argument("--watchlist", default=os.environ.get("SCHWAB_WATCHLIST", ""),
+                    help="comma-separated symbols to cycle with n/p (live mode)")
     ap.add_argument("--simulate", action="store_true", help="synthetic feed, no creds")
     ap.add_argument("--replay", metavar="FILE", help="play back a recorded JSONL tape")
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier")
@@ -247,6 +260,8 @@ def main():
     n_rows = args.rows if args.rows else 120
 
     recorder = None
+    control = None
+    watchlist: list[str] = []
     if args.replay:
         title = f"REPLAY {os.path.basename(args.replay)}"
         t = threading.Thread(target=feeds.run_replay,
@@ -265,6 +280,8 @@ def main():
         if missing:
             ap.error(f"live mode needs: {', '.join(missing)} (or use --simulate)")
         title = args.symbol
+        watchlist = _parse_watchlist(args.watchlist, args.symbol)
+        control = feeds.StreamControl()
         stream = feeds.make_stream(args.api_key, args.app_secret, args.callback_url,
                                    args.token_path, args.account_id)
         if args.record:
@@ -274,11 +291,16 @@ def main():
         t = threading.Thread(
             target=feeds.run_schwab_stream,
             kwargs=dict(stream=stream, symbol=args.symbol, raw=args.raw,
-                        trades=not args.no_trades, recorder=recorder), daemon=True)
+                        trades=not args.no_trades, recorder=recorder,
+                        control=control), daemon=True)
     t.start()
 
     hm = Heatmap(n_cols=args.cols, n_rows=n_rows, tick=args.tick, autofit=autofit)
     fig, ax, ax_cvd, im, mid_ln, scat, cvd_ln, header = build_figure(hm, title)
+    ctx = {"symbol": args.symbol if control else None, "label": title}
+
+    if control is not None:
+        _wire_switching(fig, hm, ctx, watchlist, control)
 
     def update(_):
         trades = [] if args.no_trades else state.drain_trades()
@@ -313,7 +335,7 @@ def main():
             ax_cvd.set_ylim(lo - pad, hi + pad)
             cvd_ln.set_color(BUY if hm.cvd >= 0 else SELL)
 
-        header.set_text(_header_text(hm, title))
+        header.set_text(_header_text(hm, ctx["label"]))
         return [im, mid_ln, scat, cvd_ln, header]
 
     _ = animation.FuncAnimation(fig, update, interval=300, blit=False,
@@ -323,6 +345,58 @@ def main():
     finally:
         if recorder is not None:
             recorder.close()
+
+
+def _parse_watchlist(raw: str, symbol: str) -> list[str]:
+    syms = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    if symbol.upper() not in syms:
+        syms.insert(0, symbol.upper())
+    return syms
+
+
+def _wire_switching(fig, hm, ctx, watchlist, control):
+    """Live hot-switch UI: n/p cycle the watchlist, a text box types any symbol."""
+    from matplotlib.widgets import TextBox
+
+    def do_switch(sym):
+        sym = (sym or "").strip().upper()
+        if not sym or sym == ctx["symbol"]:
+            return
+        if sym not in watchlist:
+            watchlist.append(sym)
+        # clear shared + local view and arm the stale-frame guard *before* the
+        # stream actually resubscribes, so no old-symbol frame leaks through
+        state.clear_for_symbol(sym)
+        hm.reset()
+        ctx["symbol"], ctx["label"] = sym, sym
+        try:
+            fig.canvas.manager.set_window_title(f"ovultor — {sym}")
+        except Exception:
+            pass
+        control.request_switch(sym)
+
+    def on_key(event):
+        if event.key in ("n", "p") and watchlist:
+            cur = ctx["symbol"]
+            i = watchlist.index(cur) if cur in watchlist else 0
+            i = (i + (1 if event.key == "n" else -1)) % len(watchlist)
+            do_switch(watchlist[i])
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+
+    fig.text(0.80, 0.963, "go to ▸", color=NEUTRAL, fontsize=9.5,
+             va="center", ha="right")
+    box_ax = fig.add_axes([0.815, 0.945, 0.10, 0.038])
+    box_ax.set_facecolor("#161b22")
+    tb = TextBox(box_ax, "", color="#161b22", hovercolor="#1f2630",
+                 textalignment="center")
+    tb.text_disp.set_color(FG)
+    tb.on_submit(lambda s: (do_switch(s), tb.set_val("")))
+    fig._ovultor_textbox = tb            # keep a ref so it isn't GC'd
+
+    hint = "  ".join(watchlist[:6]) + ("  …" if len(watchlist) > 6 else "")
+    fig.text(0.07, 0.013, f"n / p  cycle:  {hint}",
+             color=NEUTRAL, fontsize=8.5, va="center")
 
 
 def _header_text(hm: Heatmap, title: str) -> str:
