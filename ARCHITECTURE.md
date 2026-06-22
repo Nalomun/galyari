@@ -108,17 +108,12 @@ schwab-py refreshes it. Both files are gitignored. No migration, no rewrite — 
 
 ## Phase 5 proposals (need sign-off before building)
 
-The data layer is already renderer-agnostic, so these are additive — none require
-touching `orderbook.py` / `state.py` / `feeds.py`.
+The data layer is already renderer-agnostic, so these are additive — none require touching
+`orderbook.py` / `state.py` / `feeds.py`. Three tracks: **5A** ticker switching &
+multi-symbol, **5B** web/canvas renderer, **5C** wall/iceberg detection. Full design,
+sizing, and build order are in **[PHASE5.md](PHASE5.md)**.
 
-- **Web/canvas renderer.** Stand up a small WebSocket bridge that publishes the same
-  snapshots `state.py` holds; render in the browser with Lightweight Charts v5 + a custom
-  heatmap primitive. Far better FPS and pan/zoom than matplotlib for a scrolling heatmap.
-  Cost: a new frontend; the Python side only gains a `bridge.py` publisher.
-- **Multi-symbol.** Generalize the shared store from a single `Book` to a `dict[symbol]`
-  and run one producer subscription list; renderer gets a symbol selector / small-multiples.
-  Touches `state.py` and the renderer; parser unchanged.
-- **Liquidity-wall / iceberg detection.** A feature module over the parsed `Book` stream:
-  track per-price persistence and refill-after-trade to flag walls and likely icebergs,
-  surfaced as overlays. Pure consumer of the existing seam; good first research use of the
-  per-venue breakdown already preserved on `Level`.
+Near-term highlight: **5A Tier 1 (hot ticker switching)** — retarget the live view to a new
+symbol at runtime (key cycle over a watchlist + a type-in box), no restart. Verified that
+schwab-py exposes the needed `nasdaq_book_unsubs` / `level_one_equity_unsubs` calls; ~half
+a day of work.
