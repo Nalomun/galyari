@@ -263,8 +263,12 @@ def build_figure(hm: Heatmap, title: str):
     ax = fig.add_subplot(gs[0])
     ax_cvd = fig.add_subplot(gs[1], sharex=ax)
 
+    # PowerNorm (gamma<1) lifts small resting sizes out of inferno's near-black low
+    # end — real books are heavy-tailed, so a linear scale hides almost everything.
+    from matplotlib.colors import PowerNorm
     im = ax.imshow(hm.matrix, aspect="auto", origin="lower", cmap="inferno",
-                   interpolation="nearest", animated=True)
+                   interpolation="nearest", animated=True,
+                   norm=PowerNorm(gamma=0.5, vmin=0, vmax=1))
     (mid_ln,) = ax.plot([], [], color=MID, lw=1.1, alpha=0.9, zorder=4)
     scat = ax.scatter([], [], s=[], c=[], edgecolors="none", alpha=0.85, zorder=5)
     # microstructure overlays (Phase 5C): walls ◄ at right edge, icebergs ◆, pull flags ✕
@@ -314,6 +318,8 @@ def main():
                     help="disable wall/iceberg detection overlays (Phase 5C)")
     ap.add_argument("--record", action="store_true", help="record frames to recordings/")
     ap.add_argument("--raw", action="store_true", help="dump one book frame then continue")
+    ap.add_argument("--diag", action="store_true",
+                    help="print live book + level-one stats (sizes/levels) to diagnose")
     # creds (env from .env; CLI overrides)
     ap.add_argument("--api-key", default=os.environ.get("SCHWAB_API_KEY"))
     ap.add_argument("--app-secret", default=os.environ.get("SCHWAB_APP_SECRET"))
@@ -361,7 +367,7 @@ def main():
             target=feeds.run_schwab_stream,
             kwargs=dict(stream=stream, symbol=args.symbol, raw=args.raw,
                         trades=not args.no_trades, recorder=recorder,
-                        control=control), daemon=True)
+                        control=control, diag=args.diag), daemon=True)
     t.start()
 
     hm = Heatmap(n_cols=args.cols, n_rows=n_rows, tick=args.tick, autofit=autofit)
@@ -389,10 +395,11 @@ def main():
         hm.push(book, trades, micro.pulls if micro else ())
         im.set_data(hm.matrix)
 
-        # steady color scaling: 99th percentile of nonzero cells
+        # color scale: high percentile of nonzero cells as vmax (PowerNorm keeps its
+        # gamma). p97 over the whole matrix so a single wall doesn't crush the rest.
         nz = hm.matrix[hm.matrix > 0]
         if nz.size:
-            im.set_clim(0, np.percentile(nz, 99))
+            im.set_clim(0, max(np.percentile(nz, 97), 1.0))
 
         x = np.arange(hm.n_cols)
         if hm.row0_price is not None:

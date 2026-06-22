@@ -54,16 +54,49 @@ def make_stream(api_key, app_secret, callback_url, token_path, account_id):
     return StreamClient(client, account_id=account_id)
 
 
-def _on_book(msg, recorder=None):
+def _on_book(msg, recorder=None, diag=False):
     book = parse_nasdaq_book(msg)
     if book is None:
         return
     if not getattr(_on_book, "_seen", False):
         _on_book._seen = True
         print("[schwab] first book frame received — data is flowing.", flush=True)
+    if diag:
+        _diag_book(book)
     state.set_book(book)
     if recorder is not None:
         recorder.write_book(msg)
+
+
+def _diag_book(book):
+    """One-shot: summarize a live book frame so we can sanity-check magnitudes."""
+    if getattr(_diag_book, "_done", False):
+        return
+    _diag_book._done = True
+    import statistics
+    vols = [l.volume for l in book.bids] + [l.volume for l in book.asks]
+    if not vols:
+        print("[diag] book frame had no levels", flush=True)
+        return
+    prices = [l.price for l in book.bids] + [l.price for l in book.asks]
+    print(f"[diag] BOOK {book.symbol}: {len(book.bids)} bid / {len(book.asks)} ask "
+          f"levels | TOTAL_VOLUME min/med/max = "
+          f"{min(vols)}/{int(statistics.median(vols))}/{max(vols)} | "
+          f"price span {min(prices):.2f}–{max(prices):.2f} "
+          f"(mid {book.mid:.2f}, ${max(prices) - min(prices):.2f} wide)", flush=True)
+
+
+def _diag_l1(entry):
+    """Print the first few level-one last-sale samples (to check LAST_SIZE units)."""
+    n = getattr(_diag_l1, "_n", 0)
+    if n >= 8:
+        return
+    ls, lp = entry.get("LAST_SIZE"), entry.get("LAST_PRICE")
+    if ls is None:
+        return
+    _diag_l1._n = n + 1
+    print(f"[diag] L1 {entry.get('key', '')}: LAST_PRICE={lp} LAST_SIZE={ls} "
+          f"TRADE_TIME_MILLIS={entry.get('TRADE_TIME_MILLIS')}", flush=True)
 
 
 # Schwab's streamer has no time-of-sale service (it was dropped from the TDA
@@ -73,10 +106,12 @@ def _on_book(msg, recorder=None):
 _last_trade: dict[str, tuple[int, float, int]] = {}  # symbol -> (trade_ms, price, size)
 
 
-def _on_level_one(msg, recorder=None):
+def _on_level_one(msg, recorder=None, diag=False):
     content = (msg or {}).get("content") or []
     book = state.get_book()
     for entry in content:
+        if diag:
+            _diag_l1(entry)
         symbol = str(entry.get("key", ""))
         prev = _last_trade.get(symbol)
         trade_ms = entry.get("TRADE_TIME_MILLIS")
@@ -127,7 +162,7 @@ class StreamControl:
 
 
 def run_schwab_stream(stream, symbol, raw=False, trades=True, recorder=None,
-                      control: "StreamControl | None" = None):
+                      control: "StreamControl | None" = None, diag=False):
     """asyncio stream loop; intended to run on a background thread.
 
     Honors hot-switch commands posted via `control` between messages. A 0.5s poll
@@ -152,8 +187,8 @@ def run_schwab_stream(stream, symbol, raw=False, trades=True, recorder=None,
         print(f"[schwab] logged in; subscribing to NASDAQ_BOOK for {symbol} ...",
               flush=True)
         stream.add_nasdaq_book_handler(
-            lambda m: (_dump(m) if raw else None) or _on_book(m, recorder))
-        stream.add_level_one_equity_handler(lambda m: _on_level_one(m, recorder))
+            lambda m: (_dump(m) if raw else None) or _on_book(m, recorder, diag))
+        stream.add_level_one_equity_handler(lambda m: _on_level_one(m, recorder, diag))
         await stream.nasdaq_book_subs([symbol])
         if trades:
             await stream.level_one_equity_subs([symbol])
