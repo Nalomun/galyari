@@ -77,16 +77,48 @@ page will look broken/unreachable — that's expected, nothing is listening on t
 callback; the authorization code is in the URL. A `token.json` is written and reused
 afterward.
 
+### Record & replay
+
+```bash
+python schwab_orderflow_heatmap.py --simulate --record      # writes recordings/SIM_*.jsonl
+python schwab_orderflow_heatmap.py --symbol AAPL --record    # records a live session
+python schwab_orderflow_heatmap.py --replay recordings/AAPL_1782144614895.jsonl
+python schwab_orderflow_heatmap.py --replay <file> --speed 4 # 4× faster playback
+```
+
+The recording is an append-only JSONL event log (one frame per line, never rewritten);
+replay feeds it back through the **same** shared-state plumbing as live/sim, so the
+renderer is identical across all three modes.
+
 ### Useful flags
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--simulate` | off | synthetic book, no credentials |
+| `--simulate` | off | synthetic book + trades, no credentials |
+| `--replay FILE` | — | play back a recorded JSONL tape |
+| `--speed X` | `1.0` | replay speed multiplier |
+| `--record` | off | append frames to `recordings/` |
 | `--symbol SYM` | `$SCHWAB_SYMBOL` or `GOOG` | symbol to subscribe |
 | `--tick T` | `0.01` | price bin size (dollars) |
-| `--rows N` | `120` | number of price bins shown |
+| `--rows N` | auto-fit | price bins shown (auto-fits to book depth unless set) |
 | `--cols N` | `240` | number of time columns (history width) |
+| `--no-trades` | off | hide the trades layer (book only) |
 | `--raw` | off | dump one raw book frame then continue |
+
+### What you see
+
+- **Heatmap** — resting size at each price (brighter = more liquidity); walls show as
+  bright horizontal streaks, pulls as streaks that suddenly go dark.
+- **Cyan line** — mid price over time. The y-axis auto-recenters as price drifts.
+- **Bubbles** — trade prints, area in proportion to size, green = buyer-initiated (lifted
+  the offer), red = seller-initiated (hit the bid). See the caveat below.
+- **CVD panel** — cumulative volume delta (running Σ of signed trade size).
+- **Header** — symbol, mid, spread, book imbalance, and CVD.
+
+> **Live trades are derived from `LEVEL_ONE_EQUITY`**, not a true tick-by-tick tape —
+> Schwab's streamer has no time-of-sale service. This is fine for visualization but is an
+> approximation for trade-level research. See
+> [DATA_SCHEMA.md](DATA_SCHEMA.md#trades-derived-from-level_one_equity).
 
 ## Market-hours & entitlement caveats
 

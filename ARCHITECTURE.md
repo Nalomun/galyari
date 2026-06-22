@@ -104,4 +104,21 @@ schwab-py refreshes it. Both files are gitignored. No migration, no rewrite — 
 | 2 | Price-window recentering / auto-zoom | done |
 | 3 | Trades layer (T&S bubbles + CVD) | done |
 | 4 | Recording & replay | done |
-| 5 | Web renderer / multi-symbol / wall detection | proposed only — see DATA_SCHEMA & README |
+| 5 | Web renderer / multi-symbol / wall detection | proposed only — see below |
+
+## Phase 5 proposals (need sign-off before building)
+
+The data layer is already renderer-agnostic, so these are additive — none require
+touching `orderbook.py` / `state.py` / `feeds.py`.
+
+- **Web/canvas renderer.** Stand up a small WebSocket bridge that publishes the same
+  snapshots `state.py` holds; render in the browser with Lightweight Charts v5 + a custom
+  heatmap primitive. Far better FPS and pan/zoom than matplotlib for a scrolling heatmap.
+  Cost: a new frontend; the Python side only gains a `bridge.py` publisher.
+- **Multi-symbol.** Generalize the shared store from a single `Book` to a `dict[symbol]`
+  and run one producer subscription list; renderer gets a symbol selector / small-multiples.
+  Touches `state.py` and the renderer; parser unchanged.
+- **Liquidity-wall / iceberg detection.** A feature module over the parsed `Book` stream:
+  track per-price persistence and refill-after-trade to flag walls and likely icebergs,
+  surfaced as overlays. Pure consumer of the existing seam; good first research use of the
+  per-venue breakdown already preserved on `Level`.
