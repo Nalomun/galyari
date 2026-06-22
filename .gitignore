@@ -1,0 +1,19 @@
+# Secrets / credentials — NEVER commit these
+.env
+token.json
+
+# Recordings (can be large; not source)
+recordings/
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.swp
