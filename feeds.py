@@ -23,17 +23,34 @@ from orderbook import (
 
 # --- Live Schwab feed --------------------------------------------------------
 def make_stream(api_key, app_secret, callback_url, token_path, account_id):
-    """Manual-flow auth on the MAIN thread (you paste the redirect URL).
+    """Build a StreamClient, reusing an existing token when possible.
 
-    Returns a StreamClient; run run_schwab_stream() with it on a bg thread.
+    If `token_path` exists, load it (schwab-py auto-refreshes the 30-min access token
+    from the ~7-day refresh token — no interaction). Only when the file is missing, or
+    is unreadable/expired, do we fall back to the manual paste flow. Runs on the MAIN
+    thread so the (rare) paste happens against a clean terminal.
     """
-    from schwab.auth import client_from_manual_flow
+    import os
+    from schwab.auth import client_from_token_file, client_from_manual_flow
     from schwab.streaming import StreamClient
 
-    client = client_from_manual_flow(
-        api_key=api_key, app_secret=app_secret,
-        callback_url=callback_url, token_path=token_path)
-    print(f"[schwab] token written to {token_path}", flush=True)
+    client = None
+    if os.path.exists(token_path):
+        try:
+            client = client_from_token_file(
+                token_path=token_path, api_key=api_key, app_secret=app_secret)
+            print(f"[schwab] reusing token at {token_path} (no re-auth needed)",
+                  flush=True)
+        except Exception as e:                      # corrupt / unreadable token file
+            print(f"[schwab] couldn't load {token_path} ({e}); re-authenticating…",
+                  flush=True)
+
+    if client is None:
+        client = client_from_manual_flow(
+            api_key=api_key, app_secret=app_secret,
+            callback_url=callback_url, token_path=token_path)
+        print(f"[schwab] token written to {token_path}", flush=True)
+
     return StreamClient(client, account_id=account_id)
 
 
@@ -121,7 +138,16 @@ def run_schwab_stream(stream, symbol, raw=False, trades=True, recorder=None,
         if control is not None:
             control._bind(asyncio.get_running_loop(), ctrl_q)
 
-        await stream.login()
+        try:
+            await stream.login()
+        except Exception as e:
+            # most often: the ~7-day refresh token has expired, so the saved token
+            # can no longer be refreshed. Deleting it forces a fresh manual flow.
+            print(f"\n[schwab] login failed ({e}).\n"
+                  "  If this persists, your refresh token likely expired (~7 days).\n"
+                  "  Delete the token file and rerun to re-authenticate:\n"
+                  "    rm token.json   (or $SCHWAB_TOKEN_PATH)\n", flush=True)
+            raise
         state.set_active_symbol(symbol)
         print(f"[schwab] logged in; subscribing to NASDAQ_BOOK for {symbol} ...",
               flush=True)
