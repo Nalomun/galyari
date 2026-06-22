@@ -31,6 +31,7 @@ except ImportError:
 import state
 import feeds
 import recorder as rec_mod
+from microstructure import MicrostructureAnalyzer
 
 
 # --- Palette -----------------------------------------------------------------
@@ -42,6 +43,8 @@ MID = "#39d0ff"
 BUY = "#3fb950"
 SELL = "#f85149"
 NEUTRAL = "#8b949e"
+ICE = "#58e0ff"      # iceberg marker
+PULL = "#ffd23f"     # pulled-wall flag
 
 
 # --- Rolling heatmap with vertical recentering -------------------------------
@@ -66,6 +69,7 @@ class Heatmap:
         self.cvd_hist = np.full(n_cols, np.nan)      # cumulative volume delta per column
         self.cvd = 0.0
         self.trades: deque[dict] = deque()           # {col, price, size, side}
+        self.pull_marks: deque[dict] = deque()        # {col, price, side} — fading pull flags
         self._fitted = False
         self.last_book = None
 
@@ -77,6 +81,7 @@ class Heatmap:
         self.cvd_hist = np.full(self.n_cols, np.nan)
         self.cvd = 0.0
         self.trades.clear()
+        self.pull_marks.clear()
         self._fitted = False
         self.last_book = None
 
@@ -122,7 +127,7 @@ class Heatmap:
             self.matrix[shift:, :] = 0
         self.row0_price -= shift * self.tick
 
-    def push(self, book, new_trades) -> None:
+    def push(self, book, new_trades, new_pulls=()) -> None:
         """Advance one time column. Always scrolls so time stays honest."""
         self.last_book = book
         mid = book.mid if book is not None else None
@@ -151,11 +156,18 @@ class Heatmap:
         self.mid_hist = np.roll(self.mid_hist, -1)
         self.mid_hist[-1] = mid if mid is not None else np.nan
 
-        # age existing trades one column; drop those scrolled off-screen
+        # age existing trades + pull marks one column; drop those scrolled off-screen
         for t in self.trades:
             t["col"] -= 1
         while self.trades and self.trades[0]["col"] < 0:
             self.trades.popleft()
+        for pm in self.pull_marks:
+            pm["col"] -= 1
+        while self.pull_marks and self.pull_marks[0]["col"] < 0:
+            self.pull_marks.popleft()
+        for pl in new_pulls:
+            self.pull_marks.append({"col": self.n_cols - 1, "price": pl.price,
+                                    "side": pl.side})
 
         # ingest fresh prints at the rightmost column; integrate CVD
         for tr in new_trades:
@@ -190,6 +202,53 @@ def _trade_xyc(hm: Heatmap):
     return xs, ys, ss, cs
 
 
+def _row_of(hm: Heatmap, price: float):
+    r = (price - hm.row0_price) / hm.tick
+    return r if 0 <= r < hm.n_rows else None
+
+
+def _wall_xyc(hm: Heatmap, walls):
+    """Wall markers pinned to the right edge, area ∝ size, alpha ∝ persistence.
+
+    Persistence is baked into the RGBA color (not a per-point alpha array, which
+    conflicts with a scatter's scalar-mappable)."""
+    from matplotlib.colors import to_rgba
+    xs, ys, ss, cs = [], [], [], []
+    for w in walls:
+        r = _row_of(hm, w.price)
+        if r is None:
+            continue
+        xs.append(hm.n_cols - 1)
+        ys.append(r)
+        ss.append(40 + 90 * np.sqrt(w.size / 10000.0))
+        base = BUY if w.side == "bid" else SELL
+        cs.append(to_rgba(base, 0.35 + 0.6 * min(w.persistence, 1.0)))
+    return xs, ys, ss, cs
+
+
+def _ice_xyc(hm: Heatmap, icebergs):
+    xs, ys, ss = [], [], []
+    for ic in icebergs:
+        r = _row_of(hm, ic.price)
+        if r is None:
+            continue
+        xs.append(hm.n_cols - 1)
+        ys.append(r)
+        ss.append(60 + 30 * np.sqrt(ic.executed / 5000.0))
+    return xs, ys, ss
+
+
+def _pull_xy(hm: Heatmap):
+    xs, ys = [], []
+    for pm in hm.pull_marks:
+        r = _row_of(hm, pm["price"])
+        if r is None:
+            continue
+        xs.append(pm["col"])
+        ys.append(r)
+    return xs, ys
+
+
 def build_figure(hm: Heatmap, title: str):
     plt.rcParams.update({
         "figure.facecolor": BG, "axes.facecolor": PANEL,
@@ -208,6 +267,14 @@ def build_figure(hm: Heatmap, title: str):
                    interpolation="nearest", animated=True)
     (mid_ln,) = ax.plot([], [], color=MID, lw=1.1, alpha=0.9, zorder=4)
     scat = ax.scatter([], [], s=[], c=[], edgecolors="none", alpha=0.85, zorder=5)
+    # microstructure overlays (Phase 5C): walls ◄ at right edge, icebergs ◆, pull flags ✕
+    wall_scat = ax.scatter([], [], marker="<", s=[], c=[], edgecolors="none",
+                           alpha=0.85, zorder=6)
+    ice_scat = ax.scatter([], [], marker="D", s=[], c=[], edgecolors=BG,
+                          linewidths=0.5, alpha=0.95, zorder=8)
+    pull_scat = ax.scatter([], [], marker="x", s=[], c=[], linewidths=1.3,
+                           alpha=0.9, zorder=7)
+    overlays = {"wall": wall_scat, "ice": ice_scat, "pull": pull_scat}
     ax.set_ylabel("price")
     ax.tick_params(labelbottom=False)
     ax.grid(True, axis="y", color=GRID, lw=0.4, alpha=0.4)
@@ -227,7 +294,7 @@ def build_figure(hm: Heatmap, title: str):
     cbar.ax.yaxis.set_tick_params(color=FG)
     plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color=FG)
 
-    return fig, ax, ax_cvd, im, mid_ln, scat, cvd_ln, header
+    return fig, ax, ax_cvd, im, mid_ln, scat, cvd_ln, header, overlays
 
 
 def main():
@@ -243,6 +310,8 @@ def main():
                     help="price bins shown (default: auto-fit to book depth)")
     ap.add_argument("--cols", type=int, default=240, help="time columns (history)")
     ap.add_argument("--no-trades", action="store_true", help="hide trades layer")
+    ap.add_argument("--no-micro", action="store_true",
+                    help="disable wall/iceberg detection overlays (Phase 5C)")
     ap.add_argument("--record", action="store_true", help="record frames to recordings/")
     ap.add_argument("--raw", action="store_true", help="dump one book frame then continue")
     # creds (env from .env; CLI overrides)
@@ -296,15 +365,28 @@ def main():
     t.start()
 
     hm = Heatmap(n_cols=args.cols, n_rows=n_rows, tick=args.tick, autofit=autofit)
-    fig, ax, ax_cvd, im, mid_ln, scat, cvd_ln, header = build_figure(hm, title)
-    ctx = {"symbol": args.symbol if control else None, "label": title}
+    fig, ax, ax_cvd, im, mid_ln, scat, cvd_ln, header, overlays = build_figure(hm, title)
+    ctx = {"symbol": args.symbol if control else None, "label": title,
+           "micro": MicrostructureAnalyzer(tick=args.tick, window=args.cols)
+           if not args.no_micro else None,
+           "show_micro": not args.no_micro, "state": None}
 
     if control is not None:
-        _wire_switching(fig, hm, ctx, watchlist, control)
+        _wire_switching(fig, hm, ctx, watchlist, control, overlays)
+    _wire_micro_toggle(fig, ctx, overlays)
 
     def update(_):
+        book = state.get_book()
         trades = [] if args.no_trades else state.drain_trades()
-        hm.push(state.get_book(), trades)
+
+        micro = None
+        if ctx["micro"] is not None:
+            micro = ctx["micro"].update(book, trades)
+            ctx["state"] = micro
+            if recorder is not None:
+                _record_micro_events(recorder, micro)
+
+        hm.push(book, trades, micro.pulls if micro else ())
         im.set_data(hm.matrix)
 
         # steady color scaling: 99th percentile of nonzero cells
@@ -328,6 +410,8 @@ def main():
                 scat.set_sizes(ss if ss else [])
                 scat.set_color(cs if cs else [])
 
+            _draw_overlays(hm, micro, overlays, ctx["show_micro"])
+
         if np.isfinite(hm.cvd_hist).any():
             cvd_ln.set_data(x, hm.cvd_hist)
             lo, hi = np.nanmin(hm.cvd_hist), np.nanmax(hm.cvd_hist)
@@ -335,8 +419,9 @@ def main():
             ax_cvd.set_ylim(lo - pad, hi + pad)
             cvd_ln.set_color(BUY if hm.cvd >= 0 else SELL)
 
-        header.set_text(_header_text(hm, ctx["label"]))
-        return [im, mid_ln, scat, cvd_ln, header]
+        header.set_text(_header_text(hm, ctx["label"], micro, ctx["show_micro"]))
+        return [im, mid_ln, scat, cvd_ln, header,
+                overlays["wall"], overlays["ice"], overlays["pull"]]
 
     _ = animation.FuncAnimation(fig, update, interval=300, blit=False,
                                 cache_frame_data=False)
@@ -347,6 +432,53 @@ def main():
             recorder.close()
 
 
+def _draw_overlays(hm, micro, overlays, show):
+    """Paint wall / iceberg / pull markers, or clear them when hidden/absent."""
+    wall_scat, ice_scat, pull_scat = overlays["wall"], overlays["ice"], overlays["pull"]
+    if not show or micro is None:
+        for s in (wall_scat, ice_scat, pull_scat):
+            s.set_offsets(np.empty((0, 2)))
+        return
+
+    wx, wy, ws, wc = _wall_xyc(hm, micro.walls)
+    wall_scat.set_offsets(np.c_[wx, wy] if wx else np.empty((0, 2)))
+    wall_scat.set_sizes(ws if ws else [])
+    wall_scat.set_color(wc if wc else [])
+
+    ix, iy, iss = _ice_xyc(hm, micro.icebergs)
+    ice_scat.set_offsets(np.c_[ix, iy] if ix else np.empty((0, 2)))
+    ice_scat.set_sizes(iss if iss else [])
+    ice_scat.set_color([ICE] * len(ix) if ix else [])
+
+    px, py = _pull_xy(hm)
+    pull_scat.set_offsets(np.c_[px, py] if px else np.empty((0, 2)))
+    pull_scat.set_sizes([70] * len(px) if px else [])
+    pull_scat.set_color([PULL] * len(px) if px else [])
+
+
+def _wire_micro_toggle(fig, ctx, overlays):
+    """`m` toggles the microstructure overlays on/off (when detection is enabled)."""
+    if ctx["micro"] is None:
+        return
+
+    def on_key(event):
+        if event.key == "m":
+            ctx["show_micro"] = not ctx["show_micro"]
+            if not ctx["show_micro"]:
+                for s in overlays.values():
+                    s.set_offsets(np.empty((0, 2)))
+                fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+
+
+def _record_micro_events(recorder, micro):
+    # pulls are discrete (one frame); icebergs persist, so they'd spam the log —
+    # they stay visible in the UI instead.
+    for p in micro.pulls:
+        recorder.write_event("pull", price=p.price, side=p.side, prev_size=p.prev_size)
+
+
 def _parse_watchlist(raw: str, symbol: str) -> list[str]:
     syms = [s.strip().upper() for s in raw.split(",") if s.strip()]
     if symbol.upper() not in syms:
@@ -354,7 +486,7 @@ def _parse_watchlist(raw: str, symbol: str) -> list[str]:
     return syms
 
 
-def _wire_switching(fig, hm, ctx, watchlist, control):
+def _wire_switching(fig, hm, ctx, watchlist, control, overlays=None):
     """Live hot-switch UI: n/p cycle the watchlist, a text box types any symbol."""
     from matplotlib.widgets import TextBox
 
@@ -368,6 +500,11 @@ def _wire_switching(fig, hm, ctx, watchlist, control):
         # stream actually resubscribes, so no old-symbol frame leaks through
         state.clear_for_symbol(sym)
         hm.reset()
+        if ctx.get("micro") is not None:
+            ctx["micro"].reset()            # analyzer state is per-symbol
+        if overlays:
+            for s in overlays.values():
+                s.set_offsets(np.empty((0, 2)))
         ctx["symbol"], ctx["label"] = sym, sym
         try:
             fig.canvas.manager.set_window_title(f"ovultor — {sym}")
@@ -399,7 +536,7 @@ def _wire_switching(fig, hm, ctx, watchlist, control):
              color=NEUTRAL, fontsize=8.5, va="center")
 
 
-def _header_text(hm: Heatmap, title: str) -> str:
+def _header_text(hm: Heatmap, title: str, micro=None, show_micro=True) -> str:
     b = hm.last_book
     if b is None or b.mid is None:
         return f"{title}   waiting for book…  (market closed / no entitlement → use --simulate)"
@@ -407,8 +544,12 @@ def _header_text(hm: Heatmap, title: str) -> str:
     imb_s = f"{imb:+.2f}" if imb is not None else "  —"
     spr = b.spread
     spr_s = f"{spr:.2f}" if spr is not None else "—"
-    return (f"{title}   mid {b.mid:.2f}   spread {spr_s}   "
-            f"imbalance {imb_s}   CVD {hm.cvd:+,.0f}")
+    txt = (f"{title}   mid {b.mid:.2f}   spread {spr_s}   "
+           f"imbalance {imb_s}   CVD {hm.cvd:+,.0f}")
+    if micro is not None and show_micro:
+        txt += (f"   ·   walls {len(micro.walls)}  "
+                f"ice {len(micro.icebergs)}  pulls {len(hm.pull_marks)}")
+    return txt
 
 
 if __name__ == "__main__":

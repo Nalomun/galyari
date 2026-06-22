@@ -126,6 +126,7 @@ renderer is identical across all three modes.
 | `--rows N` | auto-fit | price bins shown (auto-fits to book depth unless set) |
 | `--cols N` | `240` | number of time columns (history width) |
 | `--no-trades` | off | hide the trades layer (book only) |
+| `--no-micro` | off | disable wall/iceberg/pull detection overlays |
 | `--raw` | off | dump one raw book frame then continue |
 
 ### What you see
@@ -136,7 +137,11 @@ renderer is identical across all three modes.
 - **Bubbles** — trade prints, area in proportion to size, green = buyer-initiated (lifted
   the offer), red = seller-initiated (hit the bid). See the caveat below.
 - **CVD panel** — cumulative volume delta (running Σ of signed trade size).
-- **Header** — symbol, mid, spread, book imbalance, and CVD.
+- **Wall / iceberg / pull overlays** (Phase 5C) — `◄` marks a persistent **wall** (large,
+  long-resting level; green=bid, red=ask, brighter=more persistent), `◆` a likely
+  **iceberg** (a level that keeps refilling under heavy execution), and an amber `✕` flags
+  a **pull** (a wall that just vanished). Toggle with `m`; disable with `--no-micro`.
+- **Header** — symbol, mid, spread, book imbalance, CVD, and live wall/iceberg/pull counts.
 
 > **Live trades are derived from `LEVEL_ONE_EQUITY`**, not a true tick-by-tick tape —
 > Schwab's streamer has no time-of-sale service. This is fine for visualization but is an
@@ -164,6 +169,6 @@ bug, and an empty book is never treated as an error. Use `--simulate` any time.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md#roadmap) for the phase roadmap. Implemented:
 parsing/book-state core, recentering auto-zoom heatmap, trades layer (bubbles + CVD),
-record/replay, and live hot ticker-switching (Phase 5A Tier 1). Remaining Phase 5
-(simultaneous multi-symbol, web renderer, wall/iceberg detection) is designed in
-[PHASE5.md](PHASE5.md) and awaiting sign-off.
+record/replay, live hot ticker-switching (Phase 5A Tier 1), and wall/iceberg/pull
+detection (Phase 5C). Remaining Phase 5 (simultaneous multi-symbol, web renderer) is
+designed in [PHASE5.md](PHASE5.md) and awaiting sign-off.

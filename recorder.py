@@ -53,6 +53,10 @@ class Recorder:
         self._write({"t": "trade", "ts_ms": trade.ts_ms, "symbol": trade.symbol,
                      "price": trade.price, "size": trade.size, "side": trade.side})
 
+    def write_event(self, kind: str, **fields) -> None:
+        """Record a derived microstructure event (pull / iceberg). Ignored on replay."""
+        self._write({"t": "event", "ts_ms": _now_ms(), "event": kind, **fields})
+
     def close(self) -> None:
         with self._lock:
             if not self._f.closed:

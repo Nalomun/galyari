@@ -117,7 +117,13 @@ as the default/fallback so the project never depends on a running browser.
 
 ---
 
-## 5C — Liquidity-wall / iceberg detection
+## 5C — Liquidity-wall / iceberg detection — ✅ IMPLEMENTED
+
+> **Status: built** in `microstructure.py` (stdlib-only consumer of the core), with
+> renderer overlays (`◄` wall, `◆` iceberg, scrolling `✕` pull), a header count, an `m`
+> toggle, `--no-micro`, per-symbol reset on hot switch, and pull events written to the
+> event log under `--record`. Tuned for precision (refills must follow execution).
+> Tested in `tests/test_microstructure.py`. Design notes kept below for reference.
 
 A feature module (`microstructure.py`) that **consumes** the parsed `Book`/`Trade` stream
 — pure use of the existing seam, no core changes — and emits events + renderer overlays.
@@ -155,7 +161,6 @@ research deliverable independent of 5A/5B.
 ## Suggested order
 
 1. ~~**5A Tier 1 (hot switching)**~~ — ✅ done.
-2. **5C (wall/iceberg)** — self-contained, offline-testable, research value; can run in
-   parallel with anything.
+2. ~~**5C (wall/iceberg)**~~ — ✅ done.
 3. **5B + 5A Tier 2 together** — the web renderer is the right home for simultaneous
    multi-symbol layouts and the FPS they need.

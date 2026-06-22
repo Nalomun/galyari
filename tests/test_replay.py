@@ -52,3 +52,14 @@ def test_replay_ignores_blank_and_bad_lines(tmp_path):
     state.reset()
     feeds.run_replay(str(path), speed=1000.0)
     assert state.get_book().best_bid.price == 10.0
+
+
+def test_replay_ignores_event_records(tmp_path):
+    path = tmp_path / "evt.jsonl"
+    r = Recorder(str(path))
+    r.write_sim_book(Book("SIM", 1, bids=(Level(10.0, 5),), asks=(Level(10.1, 5),)))
+    r.write_event("pull", price=10.0, side="bid", prev_size=9000)
+    r.close()
+    state.reset()
+    feeds.run_replay(str(path), speed=1000.0)   # event line must not break replay
+    assert state.get_book().best_bid.price == 10.0

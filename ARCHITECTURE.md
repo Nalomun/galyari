@@ -70,7 +70,9 @@ Empty book is a **valid state**, never an error (market closed / no entitlement)
    - roll the matrix left, write the new column on the right.
 3. `drain_trades()` → recent trades placed as bubbles at their price row, sized by volume,
    colored by aggressor side; CVD subpanel integrates signed volume.
-4. `imshow.set_data`, autoscale color limits, redraw mid line + y tick labels.
+4. `MicrostructureAnalyzer.update(book, trades)` → walls / pulls / icebergs, drawn as
+   right-edge markers + scrolling pull flags (Phase 5C; see below).
+5. `imshow.set_data`, autoscale color limits, redraw mid line + y tick labels.
 
 ## Modules
 
@@ -80,6 +82,7 @@ Empty book is a **valid state**, never an error (market closed / no entitlement)
 | `state.py` | Thread-safe shared store between producer and renderer. | No |
 | `feeds.py` | Producers: live Schwab stream, simulator, replay reader; `StreamControl` for hot switching. | No |
 | `recorder.py` | Append-only JSONL recording of raw frames. | No |
+| `microstructure.py` | **Consumer of the core.** Wall / pull / iceberg detection over the `Book`/`Trade` stream. Stdlib only. | No |
 | `schwab_orderflow_heatmap.py` | CLI entrypoint + matplotlib renderer (`Heatmap`). | Yes |
 
 The rule: **nothing under "stable core / producers" imports matplotlib.** A different
@@ -109,6 +112,26 @@ Live mode can retarget the subscription at runtime without a restart:
   late book from the old symbol can't flash on the new symbol's chart. (In sim/replay the
   active symbol is `None`, so the guard is inert and everything is accepted.)
 
+## Microstructure detection (Phase 5C)
+
+`microstructure.py` is a pure consumer of the parsed stream — stdlib only, importable by
+research code without the renderer. `MicrostructureAnalyzer.update(book, trades)` keeps a
+sliding window (`window` ticks) of per-price state and returns a `MicroState`:
+
+- **Wall** — a level that is large *now* (≥ `wall_mult`× the book's median size) **and** has
+  been large for ≥ `wall_min_big_frames` frames (persistence). Requiring "big now" means a
+  pulled wall stops being reported immediately.
+- **Pull** — a level that was a wall last tick and whose size just collapsed (≤ `pull_drop`
+  of its wall size). Discrete, one-shot; recorded to the event log when `--record`.
+- **Iceberg** — a level whose cumulative *executed* volume ≫ its displayed size with
+  repeated refills. Crucially a refill only counts when it follows **execution** at that
+  price within `refill_exec_window` frames — that ties refills to trading and rejects
+  pure book-size noise (the main false-positive source).
+
+The renderer state lives on the main thread alongside the analyzer; per-symbol state is
+reset on a hot switch (`analyzer.reset()` + cleared overlays). Detection is tuned to favor
+**precision over recall** — better to miss a marginal wall than to clutter the view.
+
 ## Known limitations
 
 - **matplotlib** is fine as a seed renderer but not ideal for a high-FPS scrolling
@@ -129,7 +152,8 @@ Live mode can retarget the subscription at runtime without a restart:
 | 3 | Trades layer (T&S bubbles + CVD) | done |
 | 4 | Recording & replay | done |
 | 5A.1 | Hot ticker switching (live, no restart) | done |
-| 5 (rest) | Simultaneous multi-symbol / web renderer / wall detection | proposed — see below |
+| 5C | Wall / iceberg / pull detection | done |
+| 5 (rest) | Simultaneous multi-symbol / web renderer | proposed — see below |
 
 ## Phase 5 proposals (need sign-off before building)
 
@@ -138,6 +162,6 @@ The data layer is already renderer-agnostic, so these are additive — none requ
 multi-symbol, **5B** web/canvas renderer, **5C** wall/iceberg detection. Full design,
 sizing, and build order are in **[PHASE5.md](PHASE5.md)**.
 
-**5A Tier 1 (hot ticker switching) is implemented** — see "Hot ticker switching" above.
-The remaining tracks (5A Tier 2 simultaneous multi-symbol, 5B web renderer, 5C
-wall/iceberg detection) are still proposals.
+**5A Tier 1 (hot ticker switching)** and **5C (wall/iceberg detection)** are implemented —
+see "Hot ticker switching" and "Microstructure detection" above. The remaining tracks (5A
+Tier 2 simultaneous multi-symbol, 5B web renderer) are still proposals.
