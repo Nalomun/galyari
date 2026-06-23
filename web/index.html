@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Galyari — order-flow heatmap</title>
+<style>
+  :root {
+    --bg: #070b12; --panel: #0d1420; --fg: #dde6f0; --grid: #27384d;
+    --buy: #36d68f; --sell: #ff6b66; --mid: #eaf1f8; --muted: #93a4bd;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+               font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #bar { display: flex; align-items: center; gap: 14px; padding: 7px 12px;
+         background: var(--panel); border-bottom: 1px solid var(--grid); font-size: 14px; }
+  #bar b { color: #fff; }
+  #status { margin-left: auto; color: var(--muted); font-size: 12px; }
+  #status.live::before { content: "● "; color: var(--buy); }
+  #status.down::before { content: "● "; color: var(--sell); }
+  #go { background: var(--bg); color: var(--fg); border: 1px solid var(--grid);
+        border-radius: 4px; padding: 3px 6px; width: 90px; font-family: inherit; }
+  #go:focus { outline: 1px solid var(--mid); }
+  label { color: var(--muted); font-size: 12px; }
+  #wrap { position: absolute; inset: 38px 0 0 0; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #readout { position: absolute; left: 12px; top: 8px; font-size: 13px;
+             text-shadow: 0 0 4px #000; pointer-events: none; white-space: pre; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <b id="symbol">—</b>
+    <span id="mode" style="color:var(--muted)"></span>
+    <label>go to ▸ <input id="go" placeholder="AAPL" autocomplete="off"></label>
+    <span id="hint" style="color:var(--muted);font-size:12px"></span>
+    <span id="status" class="down">connecting…</span>
+  </div>
+  <div id="wrap">
+    <canvas id="c"></canvas>
+  </div>
+  <script src="app.js?v=5"></script>
+</body>
+</html>

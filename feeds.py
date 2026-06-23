@@ -17,7 +17,7 @@ import time
 
 import state
 from orderbook import (
-    Book, Level, Trade, infer_side, parse_nasdaq_book,
+    Book, Level, Trade, infer_side, parse_books,
 )
 
 
@@ -55,15 +55,16 @@ def make_stream(api_key, app_secret, callback_url, token_path, account_id):
 
 
 def _on_book(msg, recorder=None, diag=False):
-    book = parse_nasdaq_book(msg)
-    if book is None:
+    books = parse_books(msg)            # one entry per subscribed symbol
+    if not books:
         return
     if not getattr(_on_book, "_seen", False):
         _on_book._seen = True
         print("[schwab] first book frame received — data is flowing.", flush=True)
-    if diag:
-        _diag_book(book)
-    state.set_book(book)
+    for book in books:
+        if diag:
+            _diag_book(book)
+        state.set_book(book)
     if recorder is not None:
         recorder.write_book(msg)
 
@@ -108,11 +109,11 @@ _last_trade: dict[str, tuple[int, float, int]] = {}  # symbol -> (trade_ms, pric
 
 def _on_level_one(msg, recorder=None, diag=False):
     content = (msg or {}).get("content") or []
-    book = state.get_book()
     for entry in content:
         if diag:
             _diag_l1(entry)
         symbol = str(entry.get("key", ""))
+        book = state.get_book(symbol)   # this symbol's book, for correct side inference
         prev = _last_trade.get(symbol)
         trade_ms = entry.get("TRADE_TIME_MILLIS")
         price = entry.get("LAST_PRICE")
@@ -161,13 +162,22 @@ class StreamControl:
         self._loop.call_soon_threadsafe(self._queue.put_nowait, ("switch", symbol))
 
 
-def run_schwab_stream(stream, symbol, raw=False, trades=True, recorder=None,
-                      control: "StreamControl | None" = None, diag=False):
+def run_schwab_stream(stream, symbol, symbols=None, raw=False, trades=True,
+                      recorder=None, control: "StreamControl | None" = None, diag=False):
     """asyncio stream loop; intended to run on a background thread.
 
-    Honors hot-switch commands posted via `control` between messages. A 0.5s poll
-    timeout on handle_message keeps switches responsive even when the book is quiet.
+    Subscribes to one symbol, or — when `symbols` is given (Phase 5A Tier 2) — to a whole
+    watchlist at once with `symbol` as the initial focus. Honors switch commands posted
+    via `control` between messages: in single-symbol mode a switch resubscribes; in
+    multi-symbol mode a switch to an already-subscribed symbol is just a focus change (no
+    socket op), and a new symbol is added to the subscription. A 0.5s poll timeout on
+    handle_message keeps switches responsive even when the book is quiet.
     """
+    subs = list(symbols) if symbols else [symbol]
+    if symbol not in subs:
+        subs.insert(0, symbol)
+    multi = len(subs) > 1
+
     async def go():
         ctrl_q: asyncio.Queue = asyncio.Queue()
         if control is not None:
@@ -183,25 +193,30 @@ def run_schwab_stream(stream, symbol, raw=False, trades=True, recorder=None,
                   "  Delete the token file and rerun to re-authenticate:\n"
                   "    rm token.json   (or $SCHWAB_TOKEN_PATH)\n", flush=True)
             raise
-        state.set_active_symbol(symbol)
-        print(f"[schwab] logged in; subscribing to NASDAQ_BOOK for {symbol} ...",
-              flush=True)
+        if multi:
+            state.set_subscribed(subs, focus=symbol)
+        else:
+            state.set_active_symbol(symbol)
+        print(f"[schwab] logged in; subscribing to NASDAQ_BOOK for "
+              f"{', '.join(subs)} ...", flush=True)
         stream.add_nasdaq_book_handler(
             lambda m: (_dump(m) if raw else None) or _on_book(m, recorder, diag))
         stream.add_level_one_equity_handler(lambda m: _on_level_one(m, recorder, diag))
-        await stream.nasdaq_book_subs([symbol])
+        await stream.nasdaq_book_subs(subs)
         if trades:
-            await stream.level_one_equity_subs([symbol])
+            await stream.level_one_equity_subs(subs)
         print("[schwab] subscribed, waiting for frames. "
               "Silence here = market closed (regular session ~9:30-16:00 ET) "
               "or no L2 entitlement.", flush=True)
 
-        current = symbol
+        subscribed = set(subs)
+        focus = symbol
         while True:
             if not ctrl_q.empty():
                 cmd, arg = await ctrl_q.get()
-                if cmd == "switch" and arg and arg != current:
-                    current = await _switch_symbol(stream, current, arg, trades)
+                if cmd == "switch" and arg:
+                    focus = await _apply_switch(stream, subscribed, focus, arg,
+                                                trades, multi)
                 continue
             try:
                 await asyncio.wait_for(stream.handle_message(), timeout=0.5)
@@ -209,6 +224,24 @@ def run_schwab_stream(stream, symbol, raw=False, trades=True, recorder=None,
                 pass
 
     asyncio.run(go())
+
+
+async def _apply_switch(stream, subscribed, focus, new, trades, multi):
+    """Route a switch command. Single-symbol: resubscribe. Multi-symbol: change focus
+    for free, or add a brand-new symbol to the live subscription."""
+    if not multi:
+        return await _switch_symbol(stream, focus, new, trades) if new != focus else focus
+    if new in subscribed:
+        state.set_focus(new)                 # already streaming — no socket op
+        return new
+    await stream.nasdaq_book_subs([new])     # add it to the live subscription
+    if trades:
+        await stream.level_one_equity_subs([new])
+    subscribed.add(new)
+    state.add_subscription(new)
+    state.set_focus(new)
+    print(f"[schwab] added {new} (now watching {len(subscribed)} symbols)", flush=True)
+    return new
 
 
 async def _switch_symbol(stream, old, new, trades):
@@ -236,18 +269,23 @@ def _dump(msg):
 
 
 # --- Synthetic feed (no Schwab needed) ---------------------------------------
-def run_simulate(tick=0.01, levels=60, with_trades=True, recorder=None):
-    """Random-walk mid with decaying liquidity walls + synthetic prints.
+def run_simulate(tick=0.01, levels=60, with_trades=True, recorder=None, symbols=None):
+    """Random-walk mid(s) with decaying liquidity walls + synthetic prints.
 
     Writes Book snapshots and (optionally) Trades into shared state, mirroring the
-    live producer so the renderer is identical across sim / live / replay.
+    live producer so the renderer is identical across sim / live / replay. With
+    `symbols` (Phase 5A Tier 2) each symbol gets its own independent walk at a distinct
+    base price, so the browser grid can be exercised offline. Defaults to one "SIM".
     """
-    mid = 100.0
-    walls: dict[float, float] = {}
+    syms = list(symbols) if symbols else ["SIM"]
     rng = random.Random(0xB00C)  # deterministic-ish walk; nice for demos/tests
-    while True:
-        mid += rng.gauss(0, tick * 1.5)
-        mid = round(mid / tick) * tick
+    # distinct starting prices so the symbols are visually distinguishable in the grid
+    sims = {s: {"mid": 100.0 + 40.0 * i, "walls": {}} for i, s in enumerate(syms)}
+
+    def step(s):
+        st = sims[s]
+        st["mid"] = round((st["mid"] + rng.gauss(0, tick * 1.5)) / tick) * tick
+        mid, walls = st["mid"], st["walls"]
         if rng.random() < 0.05:
             side = rng.choice([-1, 1])
             wprice = round((mid + side * rng.randint(3, 15) * tick) / tick) * tick
@@ -258,33 +296,31 @@ def run_simulate(tick=0.01, levels=60, with_trades=True, recorder=None):
                 del walls[p]
 
         def level_vol(price):
-            base = rng.randint(100, 1500)
-            return base + int(walls.get(round(price / tick) * tick, 0))
+            return rng.randint(100, 1500) + int(walls.get(round(price / tick) * tick, 0))
 
         ts_ms = int(time.time() * 1000)
-        bids = tuple(
-            Level(price=round(mid - i * tick, 4), volume=level_vol(mid - i * tick))
-            for i in range(1, levels + 1))
-        asks = tuple(
-            Level(price=round(mid + i * tick, 4), volume=level_vol(mid + i * tick))
-            for i in range(1, levels + 1))
-        book = Book(symbol="SIM", ts_ms=ts_ms, bids=bids, asks=asks)
+        bids = tuple(Level(round(mid - i * tick, 4), level_vol(mid - i * tick))
+                     for i in range(1, levels + 1))
+        asks = tuple(Level(round(mid + i * tick, 4), level_vol(mid + i * tick))
+                     for i in range(1, levels + 1))
+        book = Book(symbol=s, ts_ms=ts_ms, bids=bids, asks=asks)
         state.set_book(book)
         if recorder is not None:
             recorder.write_sim_book(book)
-
         if with_trades and rng.random() < 0.7:
-            # a print near touch, side biased by which way mid just moved
             aggro = rng.choice([-1, 1])
-            px = (asks[0].price if aggro > 0 else bids[0].price)
-            px = round(px + aggro * rng.randint(0, 2) * tick, 4)
-            size = rng.choice([100, 100, 200, 300, 500, 1000, 2500])
-            t = Trade(symbol="SIM", ts_ms=ts_ms, price=px, size=size,
+            px = round((asks[0].price if aggro > 0 else bids[0].price)
+                       + aggro * rng.randint(0, 2) * tick, 4)
+            t = Trade(symbol=s, ts_ms=ts_ms, price=px,
+                      size=rng.choice([100, 100, 200, 300, 500, 1000, 2500]),
                       side=infer_side(px, book))
             state.add_trade(t)
             if recorder is not None:
                 recorder.write_trade(t)
 
+    while True:
+        for s in syms:
+            step(s)
         time.sleep(0.25)
 
 
@@ -319,11 +355,11 @@ def run_replay(path, speed=1.0):
 
 def _apply_replay_record(rec):
     kind = rec.get("t")
-    if kind in ("book", "sim_book"):
-        if kind == "book":
-            book = parse_nasdaq_book(rec.get("msg", {}))
-        else:
-            book = _book_from_dict(rec)
+    if kind == "book":
+        for book in parse_books(rec.get("msg", {})):   # one or many symbols per frame
+            state.set_book(book)
+    elif kind == "sim_book":
+        book = _book_from_dict(rec)
         if book is not None:
             state.set_book(book)
     elif kind == "trade":

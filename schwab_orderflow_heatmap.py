@@ -34,17 +34,19 @@ import recorder as rec_mod
 from microstructure import MicrostructureAnalyzer
 
 
-# --- Palette -----------------------------------------------------------------
-BG = "#0e1117"
-PANEL = "#0e1117"
-FG = "#c9d1d9"
-GRID = "#2d333b"
-MID = "#39d0ff"
-BUY = "#3fb950"
-SELL = "#f85149"
-NEUTRAL = "#8b949e"
-ICE = "#58e0ff"      # iceberg marker
+# --- Palette (Bookmap-style: navy ground, blue heatmap, green/red flow) -------
+BG = "#070b12"
+PANEL = "#070b12"
+FG = "#c9d6e5"
+GRID = "#1b2738"
+MID = "#cdd9e6"      # near-white mid line, like the reference
+BUY = "#26c281"
+SELL = "#ec5b56"
+NEUTRAL = "#5b6b80"
+ICE = "#7fd8f0"      # iceberg marker
 PULL = "#ffd23f"     # pulled-wall flag
+# blue resting-liquidity ramp (navy → teal → cyan → near-white)
+HEAT_STOPS = ["#070b12", "#102a42", "#14496c", "#1c7096", "#3ca0c4", "#78cde6", "#cdf0fc"]
 
 
 # --- Rolling heatmap with vertical recentering -------------------------------
@@ -60,13 +62,20 @@ class Heatmap:
 
     def __init__(self, n_cols=240, n_rows=120, tick=0.01, autofit=True):
         self.n_cols = n_cols
-        self.n_rows = n_rows
         self.tick = tick
         self.autofit = autofit
-        self.matrix = np.zeros((n_rows, n_cols))
+        # STORE vs VIEW: `n_rows` is the (wide) matrix height we bin *everything* into;
+        # `view_rows` is the visible price band. Zooming changes only the view (a display
+        # crop), so zoomed-out rows already hold history instead of being rebuilt.
+        self.view_rows = n_rows
+        self.n_rows = max(n_rows, 700)
+        self.matrix = np.zeros((self.n_rows, n_cols))
         self.row0_price: float | None = None
         self.mid_hist = np.full(n_cols, np.nan)      # absolute mid price per column
+        self.bid_hist = np.full(n_cols, np.nan)      # best bid price per column
+        self.ask_hist = np.full(n_cols, np.nan)      # best ask price per column
         self.cvd_hist = np.full(n_cols, np.nan)      # cumulative volume delta per column
+        self.delta_hist = np.zeros(n_cols)           # per-column net (buy-sell) volume
         self.cvd = 0.0
         self.size_ref = 100.0                        # rolling typical trade size (EMA)
         self.trades: deque[dict] = deque()           # {col, price, size, side}
@@ -79,7 +88,10 @@ class Heatmap:
         self.matrix = np.zeros((self.n_rows, self.n_cols))
         self.row0_price = None
         self.mid_hist = np.full(self.n_cols, np.nan)
+        self.bid_hist = np.full(self.n_cols, np.nan)
+        self.ask_hist = np.full(self.n_cols, np.nan)
         self.cvd_hist = np.full(self.n_cols, np.nan)
+        self.delta_hist = np.zeros(self.n_cols)
         self.cvd = 0.0
         self.size_ref = 100.0
         self.trades.clear()
@@ -87,19 +99,22 @@ class Heatmap:
         self._fitted = False
         self.last_book = None
 
-    def set_zoom(self, n_rows: int) -> None:
-        """Manually set the visible price band (rows), recentering on the current
-        center. Disables autofit. Liquidity history is cleared (can't rebin); the
-        mid line, trades and CVD are price/time-keyed so they survive."""
-        n_rows = int(np.clip(n_rows, 30, 600))
-        center = (self.row0_price + (self.n_rows // 2) * self.tick
-                  if self.row0_price is not None else None)
-        self.n_rows = n_rows
-        self.matrix = np.zeros((n_rows, self.n_cols))
-        if center is not None:
-            self.row0_price = center - (n_rows // 2) * self.tick
+    def set_zoom(self, view_rows: int) -> None:
+        """Change the visible price band only — a display crop, not a rebin. Liquidity is
+        binned into the wider store every frame regardless of zoom, so zooming in/out just
+        reveals more/less of the *existing* history. The mid line, trades and CVD are
+        price/time-keyed and unaffected."""
+        self.view_rows = int(np.clip(view_rows, 30, 600))
         self.autofit = False
-        self._fitted = True
+        if self.view_rows + 4 > self.n_rows:          # rare: grow the store to fit the view
+            self._grow_store(self.view_rows * 2)
+
+    def _grow_store(self, new_rows: int) -> None:
+        new = np.zeros((new_rows, self.n_cols))
+        keep = min(self.matrix.shape[0], new_rows)
+        new[:keep, :] = self.matrix[:keep, :]         # row0 (and prices) preserved
+        self.matrix = new
+        self.n_rows = new_rows
 
     # --- price/row mapping ---
     def _row(self, price: float) -> int:
@@ -126,7 +141,10 @@ class Heatmap:
         if mid is None:
             return
         half = float(np.clip(mid * 0.0015, 0.15, 1.00))
-        self.n_rows = int(np.clip(round(2 * half / self.tick), 60, 240))
+        self.view_rows = int(np.clip(round(2 * half / self.tick), 60, 240))
+        # store ≈ ±2% of price (min 4× the view, so zoom-out always has data); cap memory
+        self.n_rows = int(np.clip(round(0.04 * mid / self.tick),
+                                  max(4 * self.view_rows, 700), 2400))
         self.matrix = np.zeros((self.n_rows, self.n_cols))
         self._set_center(mid)
         self._fitted = True
@@ -175,6 +193,14 @@ class Heatmap:
         self.mid_hist = np.roll(self.mid_hist, -1)
         self.mid_hist[-1] = mid if mid is not None else np.nan
 
+        # best bid/ask per column — drives the spread shading + touch staircase
+        bb = book.best_bid if book is not None else None
+        ba = book.best_ask if book is not None else None
+        self.bid_hist = np.roll(self.bid_hist, -1)
+        self.ask_hist = np.roll(self.ask_hist, -1)
+        self.bid_hist[-1] = bb.price if bb is not None else np.nan
+        self.ask_hist[-1] = ba.price if ba is not None else np.nan
+
         # age existing trades + pull marks one column; drop those scrolled off-screen
         for t in self.trades:
             t["col"] -= 1
@@ -188,14 +214,18 @@ class Heatmap:
             self.pull_marks.append({"col": self.n_cols - 1, "price": pl.price,
                                     "side": pl.side})
 
-        # ingest fresh prints at the rightmost column; integrate CVD
+        # ingest fresh prints at the rightmost column; integrate CVD + per-column delta
+        col_delta = 0.0
         for tr in new_trades:
             self.trades.append({"col": self.n_cols - 1, "price": tr.price,
                                 "size": tr.size, "side": tr.side})
             self.cvd += tr.side * tr.size
+            col_delta += tr.side * tr.size
             self.size_ref = max(1.0, 0.94 * self.size_ref + 0.06 * tr.size)
         self.cvd_hist = np.roll(self.cvd_hist, -1)
         self.cvd_hist[-1] = self.cvd
+        self.delta_hist = np.roll(self.delta_hist, -1)
+        self.delta_hist[-1] = col_delta
 
     # --- readouts ---
     def imbalance(self) -> float | None:
@@ -222,9 +252,41 @@ def _trade_xyc(hm: Heatmap):
             continue
         xs.append(t["col"])
         ys.append(r)
-        ss.append(float(np.clip(22 + 60 * np.sqrt(t["size"] / ref), 18, 420)))
+        ss.append(float(np.clip(48 + 78 * np.sqrt(t["size"] / ref), 42, 520)))
         cs.append(BUY if t["side"] > 0 else SELL if t["side"] < 0 else NEUTRAL)
     return xs, ys, ss, cs
+
+
+def _volume_profile(hm: Heatmap):
+    """Total *traded* volume per visible price row over the on-screen window, plus the
+    point-of-control (row with the most volume). The heatmap shows resting intent; this
+    shows where business actually happened — high-volume nodes are strong S/R."""
+    vol = np.zeros(hm.n_rows)
+    for t in hm.trades:
+        r = int(round((t["price"] - hm.row0_price) / hm.tick))
+        if 0 <= r < hm.n_rows:
+            vol[r] += t["size"]
+    poc = int(np.argmax(vol)) if vol.any() else None
+    return vol, poc
+
+
+def _absorption(hm: Heatmap, lookback: int = 18, tick_tol: int = 2):
+    """Heuristic: a big one-sided burst of aggression that price barely moved against.
+
+    Returns (direction, net) or None. direction='up' means net SELLING was absorbed
+    (price held → buyers defending); 'down' means net BUYING was absorbed. Conservative
+    by design — only fires when the net delta over the lookback dwarfs the typical print
+    and the mid moved <= tick_tol ticks, so it doesn't spam on ordinary flow."""
+    d = hm.delta_hist[-lookback:]
+    net = float(d.sum())
+    mh = hm.mid_hist[-lookback:]
+    finite = mh[np.isfinite(mh)]
+    if finite.size < 2:
+        return None
+    moved_ticks = abs(finite[-1] - finite[0]) / hm.tick
+    if abs(net) >= 8.0 * max(hm.size_ref, 1.0) and moved_ticks <= tick_tol:
+        return ("up" if net < 0 else "down"), net
+    return None
 
 
 def _row_of(hm: Heatmap, price: float):
@@ -245,7 +307,7 @@ def _wall_xyc(hm: Heatmap, walls):
             continue
         xs.append(hm.n_cols - 1)
         ys.append(r)
-        ss.append(40 + 90 * np.sqrt(w.size / 10000.0))
+        ss.append(110 + 150 * np.sqrt(w.size / 10000.0))
         base = BUY if w.side == "bid" else SELL
         cs.append(to_rgba(base, 0.35 + 0.6 * min(w.persistence, 1.0)))
     return xs, ys, ss, cs
@@ -259,7 +321,7 @@ def _ice_xyc(hm: Heatmap, icebergs):
             continue
         xs.append(hm.n_cols - 1)
         ys.append(r)
-        ss.append(60 + 30 * np.sqrt(ic.executed / 5000.0))
+        ss.append(120 + 55 * np.sqrt(ic.executed / 5000.0))
     return xs, ys, ss
 
 
@@ -274,57 +336,151 @@ def _pull_xy(hm: Heatmap):
     return xs, ys
 
 
+VP = "#8ab4f8"       # volume-profile fill (steel blue — distinct from buy/sell)
+POC = "#ffd23f"      # point-of-control marker
+
+
 def build_figure(hm: Heatmap, title: str):
+    import matplotlib.patheffects as pe
+    from matplotlib.colors import PowerNorm
+
     plt.rcParams.update({
         "figure.facecolor": BG, "axes.facecolor": PANEL,
         "text.color": FG, "axes.labelcolor": FG,
         "xtick.color": FG, "ytick.color": FG,
         "axes.edgecolor": GRID, "font.family": "monospace",
     })
-    fig = plt.figure(figsize=(12, 7))
-    fig.canvas.manager.set_window_title(f"ovultor — {title}")
-    gs = gridspec.GridSpec(2, 1, height_ratios=[4, 1], hspace=0.06,
-                           left=0.07, right=0.99, top=0.92, bottom=0.07)
-    ax = fig.add_subplot(gs[0])
-    ax_cvd = fig.add_subplot(gs[1], sharex=ax)
+    fig = plt.figure(figsize=(13, 7.4))
+    fig.canvas.manager.set_window_title(f"Galyari — {title}")
+    # 3 rows (heatmap / delta strip / CVD) × 3 cols (main / volume-profile / colorbar).
+    gs = gridspec.GridSpec(3, 3, height_ratios=[4, 0.7, 1.3],
+                           width_ratios=[1.0, 0.19, 0.024],
+                           hspace=0.07, wspace=0.03,
+                           left=0.065, right=0.95, top=0.92, bottom=0.075)
+    ax = fig.add_subplot(gs[0, 0])                       # heatmap
+    ax_vp = fig.add_subplot(gs[0, 1], sharey=ax)         # volume profile (by price)
+    ax_delta = fig.add_subplot(gs[1, 0], sharex=ax)      # net-delta footprint
+    ax_cvd = fig.add_subplot(gs[2, 0], sharex=ax)        # cumulative volume delta
+    cax = fig.add_subplot(gs[0, 2])                       # colorbar (heatmap height only)
 
-    # PowerNorm (gamma<1) lifts small resting sizes out of inferno's near-black low
-    # end — real books are heavy-tailed, so a linear scale hides almost everything.
-    from matplotlib.colors import PowerNorm
-    im = ax.imshow(hm.matrix, aspect="auto", origin="lower", cmap="inferno",
-                   interpolation="nearest", animated=True,
+    from matplotlib.colors import LinearSegmentedColormap
+    # Bookmap-style blue ramp: navy low end → cyan/white high. PowerNorm (gamma<1) lifts
+    # small resting sizes out of the dark end — real books are heavy-tailed, so a linear
+    # scale hides almost everything.
+    # NOTE: no animated=True. The animation runs with blit=False (full redraws),
+    # and on matplotlib 3.x an animated artist is *excluded* from a normal full
+    # draw — it only paints via the blit path. With blit off that means the image
+    # never renders (black background) while the non-animated line/scatter do. This
+    # was the "invisible heatmap" bug. animated only helps when blitting, which we
+    # don't do, so leave it off.
+    cmap = LinearSegmentedColormap.from_list("galyari_blue", HEAT_STOPS)
+    im = ax.imshow(hm.matrix, aspect="auto", origin="lower", cmap=cmap,
+                   interpolation="nearest",
                    norm=PowerNorm(gamma=0.45, vmin=0, vmax=1))
-    (mid_ln,) = ax.plot([], [], color=MID, lw=1.1, alpha=0.9, zorder=4)
-    scat = ax.scatter([], [], s=[], c=[], edgecolors="none", alpha=0.85, zorder=5)
+    # spread shading + bid/ask touch staircase: a faint translucent band between the
+    # best bid and best ask, with thin side-colored edges, so support (bid, below) vs
+    # resistance (ask, above) read at a glance and a widening spread is visible.
+    (bid_ln,) = ax.plot([], [], color=BUY, lw=0.8, alpha=0.55, zorder=3)
+    (ask_ln,) = ax.plot([], [], color=SELL, lw=0.8, alpha=0.55, zorder=3)
+    (mid_ln,) = ax.plot([], [], color=MID, lw=1.4, alpha=0.95, zorder=4)
+    # neon halo around the mid line — a soft wide stroke under the crisp line, so it
+    # reads cleanly over a busy heatmap without a second artist to manage.
+    mid_ln.set_path_effects([pe.Stroke(linewidth=4.0, foreground=MID, alpha=0.22),
+                             pe.Normal()])
+    # trades: filled dot with a thin bright rim so even small prints pop off the
+    # hot cells behind them. set_facecolor (not set_color) each frame keeps the rim.
+    scat = ax.scatter([], [], s=[], facecolors=[], edgecolors="#0d1117",
+                      linewidths=0.9, alpha=0.95, zorder=5)
     # microstructure overlays (Phase 5C): walls ◄ at right edge, icebergs ◆, pull flags ✕
-    wall_scat = ax.scatter([], [], marker="<", s=[], c=[], edgecolors="none",
-                           alpha=0.85, zorder=6)
+    wall_scat = ax.scatter([], [], marker="<", s=[], c=[], edgecolors="#0d1117",
+                           linewidths=0.8, alpha=0.95, zorder=6)
     ice_scat = ax.scatter([], [], marker="D", s=[], c=[], edgecolors=BG,
-                          linewidths=0.5, alpha=0.95, zorder=8)
-    pull_scat = ax.scatter([], [], marker="x", s=[], c=[], linewidths=1.3,
-                           alpha=0.9, zorder=7)
+                          linewidths=0.8, alpha=0.98, zorder=8)
+    pull_scat = ax.scatter([], [], marker="x", s=[], c=[], linewidths=2.2,
+                           alpha=0.95, zorder=7)
     overlays = {"wall": wall_scat, "ice": ice_scat, "pull": pull_scat}
     ax.set_ylabel("price")
     ax.tick_params(labelbottom=False)
-    ax.grid(True, axis="y", color=GRID, lw=0.4, alpha=0.4)
+    ax.grid(True, axis="y", color="#3a4d66", lw=0.6, alpha=0.55)
 
     header = ax.text(0.008, 1.02, "", transform=ax.transAxes, va="bottom",
                      ha="left", fontsize=10.5, color=FG)
+
+    # --- volume profile (right of the heatmap, shares the price axis) ---
+    (vp_line,) = ax_vp.plot([], [], color=VP, lw=0.9, alpha=0.9)
+    (vp_poc,) = ax_vp.plot([], [], color=POC, lw=1.1, alpha=0.9)   # point-of-control
+    ax_vp.set_title("vol@price", color=NEUTRAL, fontsize=8.5, pad=3)
+    # right-edge price axis lives on the far side of the volume-profile panel (it shares
+    # the heatmap's price axis), so prices read on both the left and right of the chart.
+    ax_vp.yaxis.set_label_position("right")
+    ax_vp.yaxis.set_ticks_position("right")
+    ax_vp.tick_params(labelleft=False, labelright=True, labelbottom=False, length=0,
+                      labelsize=8, colors=FG)
+    ax_vp.set_xlim(0, 1)
+    for sp in ax_vp.spines.values():
+        sp.set_alpha(0.3)
+
+    # --- delta footprint (net buy-sell per time bucket) ---
+    delta_bars = ax_delta.bar(np.arange(hm.n_cols), np.zeros(hm.n_cols),
+                              width=1.0, align="center", color=NEUTRAL, linewidth=0)
+    ax_delta.axhline(0, color=GRID, lw=0.6)
+    ax_delta.set_ylabel("Δ", rotation=0, labelpad=10, va="center")
+    ax_delta.tick_params(labelbottom=False)
+    ax_delta.set_xlim(0, hm.n_cols - 1)
 
     (cvd_ln,) = ax_cvd.plot([], [], color=NEUTRAL, lw=1.2)
     ax_cvd.axhline(0, color=GRID, lw=0.6)
     ax_cvd.set_ylabel("CVD")
     ax_cvd.set_xlabel("time →")
     ax_cvd.set_xlim(0, hm.n_cols - 1)
-    ax_cvd.grid(True, color=GRID, lw=0.4, alpha=0.4)
+    ax_cvd.grid(True, color="#3a4d66", lw=0.5, alpha=0.45)
 
-    cbar = fig.colorbar(im, ax=[ax, ax_cvd], pad=0.012, fraction=0.035)
+    cbar = fig.colorbar(im, cax=cax)
     cbar.set_label("resting size", color=FG)
     cbar.ax.yaxis.set_tick_params(color=FG)
     plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color=FG)
 
+    # vertical dashed time guides every 50 columns, across all stacked panels (drawn over
+    # the heatmap so they stay visible on bright cells)
+    for gx in range(50, hm.n_cols, 50):
+        ax.axvline(gx, color=FG, lw=0.7, alpha=0.18, ls=(0, (2, 4)), zorder=1.5)
+        ax_delta.axvline(gx, color=FG, lw=0.7, alpha=0.15, ls=(0, (2, 4)), zorder=0.5)
+        ax_cvd.axvline(gx, color=FG, lw=0.7, alpha=0.15, ls=(0, (2, 4)), zorder=0.5)
+    # clearer panel edges
+    for a in (ax, ax_vp, ax_delta, ax_cvd):
+        for sp in a.spines.values():
+            sp.set_visible(True)
+            sp.set_color("#46618a")
+            sp.set_linewidth(1.1)
+            sp.set_alpha(0.9)
+
+    _draw_legend(fig)
     _silence_resize_widget_bug(fig)
-    return fig, ax, ax_cvd, im, mid_ln, scat, cvd_ln, header, overlays
+    return {
+        "fig": fig, "ax": ax, "ax_vp": ax_vp, "ax_delta": ax_delta, "ax_cvd": ax_cvd,
+        "im": im, "mid_ln": mid_ln, "bid_ln": bid_ln, "ask_ln": ask_ln, "scat": scat,
+        "cvd_ln": cvd_ln, "vp_line": vp_line, "vp_poc": vp_poc, "delta_bars": delta_bars,
+        "header": header, "overlays": overlays,
+        # holders for collections rebuilt each frame (fill_between can't be set_data'd)
+        "holders": {"spread": None, "vp_fill": None},
+    }
+
+
+def _draw_legend(fig):
+    """Compact key in the empty lower-right so the color/marker mapping isn't memorised."""
+    rows = [
+        (BUY, "● buy print (size∝vol)"),
+        (SELL, "● sell print"),
+        (MID, "━ mid · bid/ask touch"),
+        (FG, "◄ wall  ◆ ice  ✕ pull"),
+        (VP, "▌ vol @ price"),
+        (POC, "━ point of control"),
+    ]
+    fig.text(0.79, 0.335, "legend", color=NEUTRAL, fontsize=8.5, va="center", ha="left")
+    y = 0.30
+    for color, label in rows:
+        fig.text(0.79, y, label, color=color, fontsize=8, va="center", ha="left")
+        y -= 0.032
 
 
 def _silence_resize_widget_bug(fig):
@@ -414,7 +570,14 @@ def main():
     t.start()
 
     hm = Heatmap(n_cols=args.cols, n_rows=n_rows, tick=args.tick, autofit=autofit)
-    fig, ax, ax_cvd, im, mid_ln, scat, cvd_ln, header, overlays = build_figure(hm, title)
+    ui = build_figure(hm, title)
+    fig, ax, ax_vp, ax_delta, ax_cvd = (ui["fig"], ui["ax"], ui["ax_vp"],
+                                        ui["ax_delta"], ui["ax_cvd"])
+    im, mid_ln, bid_ln, ask_ln, scat = (ui["im"], ui["mid_ln"], ui["bid_ln"],
+                                        ui["ask_ln"], ui["scat"])
+    cvd_ln, vp_line, vp_poc = ui["cvd_ln"], ui["vp_line"], ui["vp_poc"]
+    delta_bars, header, overlays, holders = (ui["delta_bars"], ui["header"],
+                                             ui["overlays"], ui["holders"])
     ctx = {"symbol": args.symbol if control else None, "label": title,
            "micro": MicrostructureAnalyzer(tick=args.tick, window=args.cols)
            if not args.no_micro else None,
@@ -439,8 +602,8 @@ def main():
                 nzc = int((hm.matrix > 0).sum())
                 lo = hm.row0_price
                 hi = lo + hm.n_rows * hm.tick
-                print(f"[diag] HEATMAP frame {diag_frames['n']}: rows={hm.n_rows} "
-                      f"window {lo:.2f}–{hi:.2f} | nonzero {nzc} "
+                print(f"[diag] HEATMAP frame {diag_frames['n']}: view={hm.view_rows} "
+                      f"store={hm.n_rows} band {lo:.2f}–{hi:.2f} | nonzero {nzc} "
                       f"({100 * nzc / hm.matrix.size:.1f}%) | matrix_max "
                       f"{hm.matrix.max():.0f} | size_ref {hm.size_ref:.0f} | "
                       f"bubbles {len(hm.trades)}", flush=True)
@@ -454,36 +617,85 @@ def main():
 
         hm.push(book, trades, micro.pulls if micro else ())
         im.set_data(hm.matrix)
-        # CRITICAL: keep the image extent and axes y-limits locked to the current
-        # row count. n_rows changes on autofit and on +/- zoom; if these aren't
-        # updated, the heatmap, mid line and bubbles end up in different coordinate
-        # systems (heatmap stretched/clipped, everything misaligned).
-        im.set_extent((-0.5, hm.n_cols - 0.5, -0.5, hm.n_rows - 0.5))
-        ax.set_ylim(-0.5, hm.n_rows - 0.5)
+        # The image spans the full (wide) store; the visible price band is a CROP set via
+        # the y-limits — so +/- zoom just reveals more/less of already-binned history
+        # rather than rebuilding. extent must cover the whole store or the row→data
+        # mapping (mid line, bubbles, overlays) drifts out of alignment.
+        store = hm.n_rows
+        im.set_extent((-0.5, hm.n_cols - 0.5, -0.5, store - 0.5))
+        # visible window: center on the latest mid (fallback: store center), view_rows tall
+        if hm.row0_price is not None and np.isfinite(hm.mid_hist[-1]):
+            cr = (hm.mid_hist[-1] - hm.row0_price) / hm.tick
+        else:
+            cr = store / 2.0
+        lo, hi = cr - hm.view_rows / 2.0, cr + hm.view_rows / 2.0
+        if lo < 0:
+            lo, hi = 0.0, float(hm.view_rows)
+        if hi > store:
+            lo, hi = float(store - hm.view_rows), float(store)
+        lo, hi = max(lo, 0.0), min(hi, float(store))
+        ax.set_ylim(lo - 0.5, hi - 0.5)
 
-        # color scale: high percentile of nonzero cells as vmax (PowerNorm keeps its
-        # gamma). p97 over the whole matrix so a single wall doesn't crush the rest.
-        nz = hm.matrix[hm.matrix > 0]
+        # color scale: vmax from the nonzero cells in the VISIBLE crop (PowerNorm keeps its
+        # gamma). A persistent wall occupies its row in EVERY column, so it is well above
+        # p97; the median is robust to that, so cap vmax at a small multiple of it — walls
+        # still saturate to the bright end, but the typical book stays visible.
+        crop = hm.matrix[int(lo):int(np.ceil(hi))]
+        nz = crop[crop > 0]
         if nz.size:
-            im.set_clim(0, max(np.percentile(nz, 97), 1.0))
+            vmax = min(np.percentile(nz, 97), np.median(nz) * 6.0)
+            im.set_clim(0, max(vmax, 1.0))
 
         x = np.arange(hm.n_cols)
         if hm.row0_price is not None:
-            rp = hm.row_prices()
-            yt = np.linspace(0, hm.n_rows - 1, 7)
+            yt = np.linspace(lo, hi - 1, 7)
+            labels = [f"{hm.row0_price + r * hm.tick:7.2f}" for r in yt]
             ax.set_yticks(yt)
-            ax.set_yticklabels([f"{p:7.2f}" for p in
-                                np.interp(yt, [0, hm.n_rows - 1], [rp[0], rp[-1]])])
-            rows = (hm.mid_hist - hm.row0_price) / hm.tick
-            mid_ln.set_data(x, np.where(np.isnan(hm.mid_hist), np.nan, rows))
+            ax.set_yticklabels(labels)
+            ax_vp.set_yticks(yt)                      # right-edge price axis (shared y)
+            ax_vp.set_yticklabels(labels)
+            def to_rows(h):
+                return np.where(np.isnan(h), np.nan, (h - hm.row0_price) / hm.tick)
+
+            mid_ln.set_data(x, to_rows(hm.mid_hist))
+            bid_rows, ask_rows = to_rows(hm.bid_hist), to_rows(hm.ask_hist)
+            bid_ln.set_data(x, bid_rows)
+            ask_ln.set_data(x, ask_rows)
+            # spread band: rebuild the fill (fill_between has no set_data)
+            if holders["spread"] is not None:
+                holders["spread"].remove()
+            valid = np.isfinite(bid_rows) & np.isfinite(ask_rows)
+            holders["spread"] = ax.fill_between(
+                x, bid_rows, ask_rows, where=valid, interpolate=False,
+                color=MID, alpha=0.10, zorder=2, linewidth=0)
 
             if not args.no_trades:
                 xs, ys, ss, cs = _trade_xyc(hm)
                 scat.set_offsets(np.c_[xs, ys] if xs else np.empty((0, 2)))
                 scat.set_sizes(ss if ss else [])
-                scat.set_color(cs if cs else [])
+                scat.set_facecolor(cs if cs else [])
 
             _draw_overlays(hm, micro, overlays, ctx["show_micro"])
+
+            # volume profile (traded volume by price) + point-of-control
+            vol, poc = _volume_profile(hm)
+            yr = np.arange(hm.n_rows)
+            vp_line.set_data(vol, yr)
+            if holders["vp_fill"] is not None:
+                holders["vp_fill"].remove()
+            holders["vp_fill"] = ax_vp.fill_betweenx(yr, 0, vol, color=VP, alpha=0.30)
+            ax_vp.set_xlim(0, max(vol.max(), 1.0) * 1.08)
+            if poc is not None and vol[poc] > 0:
+                vp_poc.set_data([0, vol[poc]], [poc, poc])
+            else:
+                vp_poc.set_data([], [])
+
+        # delta footprint: net buy-sell per column, green up / red down
+        dmax = float(np.max(np.abs(hm.delta_hist))) if hm.delta_hist.size else 0.0
+        for rect, h in zip(delta_bars, hm.delta_hist):
+            rect.set_height(h)
+            rect.set_color(BUY if h > 0 else SELL if h < 0 else NEUTRAL)
+        ax_delta.set_ylim(-dmax * 1.15 - 1, dmax * 1.15 + 1)
 
         if np.isfinite(hm.cvd_hist).any():
             cvd_ln.set_data(x, hm.cvd_hist)
@@ -493,7 +705,7 @@ def main():
             cvd_ln.set_color(BUY if hm.cvd >= 0 else SELL)
 
         header.set_text(_header_text(hm, ctx["label"], micro, ctx["show_micro"]))
-        return [im, mid_ln, scat, cvd_ln, header,
+        return [im, mid_ln, bid_ln, ask_ln, scat, cvd_ln, vp_line, vp_poc, header,
                 overlays["wall"], overlays["ice"], overlays["pull"]]
 
     _ = animation.FuncAnimation(fig, update, interval=300, blit=False,
@@ -525,20 +737,30 @@ def _draw_overlays(hm, micro, overlays, show):
 
     px, py = _pull_xy(hm)
     pull_scat.set_offsets(np.c_[px, py] if px else np.empty((0, 2)))
-    pull_scat.set_sizes([70] * len(px) if px else [])
+    pull_scat.set_sizes([120] * len(px) if px else [])
     pull_scat.set_color([PULL] * len(px) if px else [])
 
 
 def _wire_zoom(fig, hm):
-    """+/- change the visible price band (works in every mode)."""
+    """Zoom the visible price band: +/- keys or the mouse wheel (works in every mode)."""
+    def zoom_in():
+        hm.set_zoom(int(hm.view_rows / 1.3)); fig.canvas.draw_idle()
+
+    def zoom_out():
+        hm.set_zoom(int(hm.view_rows * 1.3)); fig.canvas.draw_idle()
+
     def on_key(event):
         if event.key in ("+", "="):
-            hm.set_zoom(int(hm.n_rows / 1.3))
-            fig.canvas.draw_idle()
+            zoom_in()
         elif event.key in ("-", "_"):
-            hm.set_zoom(int(hm.n_rows * 1.3))
-            fig.canvas.draw_idle()
+            zoom_out()
+
+    def on_scroll(event):
+        # scroll up zooms out, scroll down zooms in (event.step +ve = up)
+        (zoom_out if (event.step or 0) > 0 else zoom_in)()
+
     fig.canvas.mpl_connect("key_press_event", on_key)
+    fig.canvas.mpl_connect("scroll_event", on_scroll)
 
 
 def _wire_micro_toggle(fig, ctx, overlays):
@@ -592,7 +814,7 @@ def _wire_switching(fig, hm, ctx, watchlist, control, overlays=None):
                 s.set_offsets(np.empty((0, 2)))
         ctx["symbol"], ctx["label"] = sym, sym
         try:
-            fig.canvas.manager.set_window_title(f"ovultor — {sym}")
+            fig.canvas.manager.set_window_title(f"Galyari — {sym}")
         except Exception:
             pass
         control.request_switch(sym)
@@ -613,8 +835,17 @@ def _wire_switching(fig, hm, ctx, watchlist, control, overlays=None):
     tb = TextBox(box_ax, "", color="#161b22", hovercolor="#1f2630",
                  textalignment="center")
     tb.text_disp.set_color(FG)
-    tb.on_submit(lambda s: (do_switch(s), tb.set_val("")))
-    fig._ovultor_textbox = tb            # keep a ref so it isn't GC'd
+
+    def on_submit(s):
+        do_switch(s)
+        tb.set_val("")
+        # release the box's keyboard capture so +/- (and n/p) zoom/cycle instead of
+        # typing into it; otherwise it stays in editing mode after Enter
+        if hasattr(tb, "stop_typing"):
+            tb.stop_typing()
+
+    tb.on_submit(on_submit)
+    fig._galyari_textbox = tb            # keep a ref so it isn't GC'd
 
     hint = "  ".join(watchlist[:6]) + ("  …" if len(watchlist) > 6 else "")
     fig.text(0.07, 0.013, f"n / p  cycle:  {hint}",
@@ -634,6 +865,12 @@ def _header_text(hm: Heatmap, title: str, micro=None, show_micro=True) -> str:
     if micro is not None and show_micro:
         txt += (f"   ·   walls {len(micro.walls)}  "
                 f"ice {len(micro.icebergs)}  pulls {len(hm.pull_marks)}")
+    absorb = _absorption(hm)
+    if absorb is not None:
+        direction, net = absorb
+        arrow = "↑" if direction == "up" else "↓"
+        who = "sellers absorbed" if direction == "up" else "buyers absorbed"
+        txt += f"   ·   ⚠ ABSORPTION {arrow} ({who}, Δ{net:+,.0f})"
     return txt
 
 

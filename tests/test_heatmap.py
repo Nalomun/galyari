@@ -63,35 +63,37 @@ def test_cvd_integrates_signed_size():
     assert hm.cvd_hist[-1] == 200
 
 
-def test_autofit_matrix_shape_matches_nrows():
-    # the matrix row count must equal n_rows after autofit, or the renderer's
-    # ylim/extent (driven by n_rows) won't match the image — the alignment bug.
+def test_autofit_sets_view_and_wide_store():
+    # autofit picks a sensible VIEW band (~0.15% of price) but the matrix STORE is wider,
+    # so zooming out later reveals already-binned history instead of empty rows.
     hm = Heatmap(n_cols=20, tick=0.01, autofit=True)
     hm.push(book_at(300.0, levels=20), [])
+    assert 60 <= hm.view_rows <= 240
     assert hm.matrix.shape == (hm.n_rows, hm.n_cols)
-    assert 60 <= hm.n_rows <= 240
+    assert hm.n_rows >= 4 * hm.view_rows               # store comfortably wider than view
 
 
-def test_set_zoom_reallocates_and_keeps_center():
+def test_set_zoom_changes_view_only_and_preserves_data():
     hm = Heatmap(n_cols=20, tick=0.01, autofit=True)
-    hm.push(book_at(100.0), [])
-    r0 = hm.n_rows
+    hm.push(book_at(100.0, levels=20), [])
+    store0, before = hm.n_rows, hm.matrix.sum()
     center0 = hm.row0_price + (hm.n_rows // 2) * hm.tick
-    hm.set_zoom(int(r0 * 1.5))
-    assert hm.matrix.shape == (hm.n_rows, hm.n_cols)
-    assert hm.n_rows != r0
+    hm.set_zoom(int(hm.view_rows * 1.5))               # zoom out
+    assert hm.view_rows != 0
+    assert hm.matrix.sum() == before                   # liquidity NOT rebuilt/lost
+    assert hm.n_rows == store0                          # store untouched (fits the view)
     center1 = hm.row0_price + (hm.n_rows // 2) * hm.tick
-    assert abs(center1 - center0) < hm.tick * 1.5          # center preserved
-    assert hm.autofit is False                             # manual zoom pins it
+    assert abs(center1 - center0) < hm.tick * 1.5       # store still anchored
+    assert hm.autofit is False                          # manual zoom pins it
 
 
 def test_set_zoom_clamped():
     hm = Heatmap(n_cols=20, tick=0.01, autofit=False, n_rows=120)
     hm.push(book_at(100.0), [])
     hm.set_zoom(5)
-    assert hm.n_rows == 30 and hm.matrix.shape[0] == 30    # min clamp
+    assert hm.view_rows == 30                            # min clamp (view, not store)
     hm.set_zoom(9999)
-    assert hm.n_rows == 600 and hm.matrix.shape[0] == 600  # max clamp
+    assert hm.view_rows == 600 and hm.matrix.shape[0] >= 600   # store grew to fit
 
 
 def test_imbalance_sign():

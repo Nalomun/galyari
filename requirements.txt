@@ -3,5 +3,9 @@ matplotlib>=3.8
 schwab-py>=1.5
 python-dotenv>=1.0
 
+# Web renderer (bridge.py / Phase 5B) — only needed for the browser frontend.
+# The matplotlib renderer does not require it.
+websockets>=12.0
+
 # Dev / tests
 pytest>=8.0

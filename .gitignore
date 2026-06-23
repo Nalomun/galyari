@@ -17,3 +17,12 @@ venv/
 # OS / editor
 .DS_Store
 *.swp
+
+# Local scratch / screenshots (not source)
+Pasted image*.png
+
+# Internal build brief — kept locally, not part of the public repo
+CLAUDE_CODE_KICKOFF.md
+
+# Local agent / editor config
+.claude/

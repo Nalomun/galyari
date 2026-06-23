@@ -24,7 +24,8 @@ price×time matrix, and renders it.
                               ┌────────────────────────────────────────┐
                               │  matplotlib main loop (FuncAnimation)   │
                               │  Heatmap.push() → rolling matrix        │
-                              │  imshow + mid line + trade bubbles+CVD  │
+                              │  imshow + mid/bid/ask + bubbles +       │
+                              │  volume profile + Δ strip + CVD         │
                               └────────────────────────────────────────┘
 ```
 
@@ -46,14 +47,21 @@ with a single `asyncio.Lock`. See "Hot ticker switching" below.
 
 ## The shared-state contract (`state.py`)
 
-A tiny module holding the latest `Book` and a bounded trade buffer behind one
-`threading.Lock`.
+A tiny module holding the latest `Book` **per symbol** and a bounded trade buffer per
+symbol behind one `threading.Lock`.
 
-- **Writers** (producers): `set_book(book)`, `add_trade(trade)`.
-- **Reader** (render loop): `get_book()`, `drain_trades()`.
-- The store keeps only the **latest** book (full snapshot — see DATA_SCHEMA) and a small
-  ring of recent trades. There is no history kept here; history lives in the renderer's
-  rolling matrix and (optionally) the recording file.
+- **Writers** (producers): `set_book(book)`, `add_trade(trade)` — routed by `book.symbol`.
+- **Reader** (render loop): `get_book(symbol=None)`, `drain_trades(symbol=None)` — the
+  no-arg form returns the **focused** symbol, so the single-symbol matplotlib renderer is
+  unchanged. Multi-symbol callers use `set_subscribed`, `set_focus`, `get_books`.
+- The store keeps only the **latest** book per symbol (full snapshot — see DATA_SCHEMA) and
+  a small ring of recent trades each. There is no history kept here; history lives in the
+  renderer's rolling matrix and (optionally) the recording file.
+- A guard (`_subscribed`: a *set*, or `None` = accept-all for sim/replay) drops frames for
+  symbols that aren't being watched — this both prevents stale post-switch frames and bounds
+  the tracked set. `_focus` selects which symbol the no-arg getters return. Phase 5A Tier 2
+  generalized `_book`→`_books` and the single active symbol→`_subscribed`; the old
+  `set_active_symbol` / `clear_for_symbol` shims keep single-symbol semantics intact.
 - Everything handed across the boundary is treated as **immutable** by convention:
   producers build a fresh `Book` and hand it over; the reader never mutates what it reads.
   This keeps the lock hold-time to a single assignment / list append.
@@ -69,10 +77,14 @@ Empty book is a **valid state**, never an error (market closed / no entitlement)
    - bin every `(price, volume)` level into the current column by absolute price,
    - roll the matrix left, write the new column on the right.
 3. `drain_trades()` → recent trades placed as bubbles at their price row, sized by volume,
-   colored by aggressor side; CVD subpanel integrates signed volume.
-4. `MicrostructureAnalyzer.update(book, trades)` → walls / pulls / icebergs, drawn as
-   right-edge markers + scrolling pull flags (Phase 5C; see below).
-5. `imshow.set_data`, autoscale color limits, redraw mid line + y tick labels.
+   colored by aggressor side. The same prints integrate **CVD** (running Σ signed size,
+   bottom panel) and **per-column delta** (net buy−sell for that time bucket, the Δ strip).
+4. record best bid/ask into `bid_hist`/`ask_hist` (drives the touch staircase + spread band)
+   and traded-volume-by-price into the **volume profile** + point-of-control (right margin).
+5. `MicrostructureAnalyzer.update(book, trades)` → walls / pulls / icebergs, drawn as
+   right-edge markers + scrolling pull flags (Phase 5C; see below). The header also runs a
+   conservative **absorption** check (big one-sided delta vs. ≤2 ticks of price movement).
+6. `imshow.set_data`, autoscale color limits, redraw mid/bid/ask lines + y tick labels.
 
 ## Modules
 
@@ -84,9 +96,12 @@ Empty book is a **valid state**, never an error (market closed / no entitlement)
 | `recorder.py` | Append-only JSONL recording of raw frames. | No |
 | `microstructure.py` | **Consumer of the core.** Wall / pull / iceberg detection over the `Book`/`Trade` stream. Stdlib only. | No |
 | `schwab_orderflow_heatmap.py` | CLI entrypoint + matplotlib renderer (`Heatmap`). | Yes |
+| `bridge.py` + `web/` | Alternative frontend (Phase 5B): WebSocket publisher + browser canvas. Reads the same `state.py` getters; needs `websockets`, not matplotlib. | No |
 
-The rule: **nothing under "stable core / producers" imports matplotlib.** A different
-frontend (web/canvas) could replace only `schwab_orderflow_heatmap.py`.
+The rule: **nothing under "stable core / producers" imports matplotlib.** That the data
+layer is renderer-agnostic is no longer hypothetical — `bridge.py` + `web/` is a second
+frontend that reuses `feeds`/`state`/`orderbook` unchanged and never imports matplotlib
+(see "Browser renderer" below).
 
 ## Auth (left as-is, locked)
 
@@ -132,6 +147,37 @@ The renderer state lives on the main thread alongside the analyzer; per-symbol s
 reset on a hot switch (`analyzer.reset()` + cleared overlays). Detection is tuned to favor
 **precision over recall** — better to miss a marginal wall than to clutter the view.
 
+## Render panels & analytics overlays
+
+The renderer is a **3×3 `GridSpec`**: heatmap (main) + volume profile (right, shares the
+price axis) + colorbar across the top row; the **Δ footprint** strip and the **CVD** line
+stack below the heatmap and share its x (time) axis. `build_figure` returns a **handle
+dict**, not a positional tuple — the old 9-tuple stopped scaling once the panel count grew,
+and a dict lets `update()` pull artists by name (`ui["vp_line"]`, `ui["delta_bars"]`, …).
+
+All series are derived in the renderer from the parsed `Book`/`Trade` stream — **no core
+changes**. `Heatmap` tracks three new scroll-aligned histories alongside `mid_hist`, all
+rolled one column per tick so they survive zoom/recenter the same way:
+
+- `bid_hist` / `ask_hist` — best bid/ask price per column → the touch staircase + the
+  translucent spread band (`fill_between`).
+- `delta_hist` — net (buy−sell) volume per column → the Δ footprint bars. Distinct from
+  `cvd_hist`, which is the running cumulative sum.
+
+Two artists can't be `set_data`'d in place because they're collections, so they're
+`.remove()`d and rebuilt each frame from `holders` (the spread `fill_between` and the
+volume-profile `fill_betweenx`). The **volume profile** sums `trades` by price row over the
+visible window and marks the point-of-control (argmax); the **absorption** flag is a
+header-only heuristic (`_absorption`) — it fires only when |Σ delta| over a short lookback
+is ≥ 8× the rolling typical print *and* the mid moved ≤ 2 ticks, deliberately quiet to
+avoid marker spam. A compact **legend** is drawn once in the empty lower-right.
+
+> The "invisible heatmap" footgun lives here too: the `imshow` artist must **not** be
+> `animated=True`. The animation runs `blit=False` (full redraws), and an animated artist
+> is excluded from a normal full draw on matplotlib 3.x — it only paints on the blit path,
+> so with blit off the heatmap never rendered (black background) while the non-animated
+> lines/scatter did.
+
 ## Known limitations
 
 - **matplotlib** is fine as a seed renderer but not ideal for a high-FPS scrolling
@@ -147,6 +193,46 @@ reset on a hot switch (`analyzer.reset()` + cleared overlays). Detection is tune
 - The per-venue breakdown of each level is parsed and available on `Level` but not yet
   visualized.
 
+## Browser renderer (Phase 5B)
+
+`bridge.py` is a **peer of the matplotlib renderer**, not a layer on top of it: it launches
+the same producer thread (`_start_producer` mirrors the renderer's `main`) filling
+`state.py`, then runs an asyncio WebSocket server instead of a GUI loop.
+
+```
+state.py ──▶ bridge.py ─ push loop (──▶ websockets.broadcast) ──▶ browser canvas (web/)
+             get_book() + drain_trades() once per --hz tick        ingest → scroll → draw
+             ◀── {"type":"switch"} ── StreamControl ──◀────────── go-to box
+```
+
+- **One frame per column tick, every symbol in full.** The push loop drains `state` every
+  `1/hz` s (default 4 Hz, matching the matplotlib column cadence) and broadcasts a JSON frame
+  with an `order` list and a `symbols` map — each entry carrying that symbol's `bids`/`asks`
+  arrays, `mid`/`spread`/`imbalance`, the *new* `trades` since last tick, running `cvd`, and
+  per-column `delta`. Sending all watched symbols (not just a focus) is what lets the browser
+  render a grid. CVD/delta are accumulated server-side *per symbol* so a late-joining browser
+  is consistent; draining always (even with no clients) keeps CVD continuous and the per-
+  symbol trade deques self-bound.
+- **The browser owns the matrices.** `web/app.js` keeps one rolling price×time matrix *per
+  symbol* (a `View`) client-side and paints each the way GPU heatmaps do — a 1px-per-cell
+  offscreen image scaled up with smoothing off — overlaying mid/bid/ask, spread band, trade
+  bubbles, a volume profile, a Δ strip and a CVD strip as vectors. Each `View` auto-fits its
+  price band to ≈0.15% of price and supports wheel / `+`/`−` zoom (a zoom re-bins, like the
+  matplotlib `+`/`−`); recenter is a vertical roll of the stored columns, so history stays
+  price-anchored.
+- **Layout: grid + expand (5A Tier 2).** One symbol → the full view. Several → a grid of
+  live mini-heatmaps (all on screen at once); click a tile to expand to the full view, Esc to
+  return. Because every symbol streams continuously, expanding is purely client-side — no
+  server round-trip.
+- **Control.** With a multi-symbol `--watchlist` the bridge subscribes to all of them up
+  front (`run_schwab_stream(symbols=…)` → `set_subscribed`); `--simulate --watchlist …` runs
+  an independent synthetic walk per symbol for offline grid testing. A
+  `{"type":"switch","symbol":…}` adds a symbol not yet watched (live) or, in single-symbol
+  mode, resubscribes exactly as the matplotlib UI does. No-op in sim/replay (no `control`).
+- **Deps & fallback.** Needs `websockets` (optional; matplotlib renderer doesn't). The
+  frontend is dependency-free vanilla canvas served by a tiny stdlib HTTP server, so there
+  is no build step and nothing fetched from a CDN. matplotlib stays the default.
+
 ## Roadmap
 
 | Phase | Scope | State |
@@ -158,7 +244,9 @@ reset on a hot switch (`analyzer.reset()` + cleared overlays). Detection is tune
 | 4 | Recording & replay | done |
 | 5A.1 | Hot ticker switching (live, no restart) | done |
 | 5C | Wall / iceberg / pull detection | done |
-| 5 (rest) | Simultaneous multi-symbol / web renderer | proposed — see below |
+| 5D | Analytics panels (volume profile/VPOC, Δ footprint, bid/ask+spread band, legend, absorption flag) | done |
+| 5B | Web/canvas renderer (`bridge.py` + `web/`, vanilla-canvas slice) | done |
+| 5A.2 | Simultaneous multi-symbol (browser focus+sidebar) | done |
 
 ## Phase 5 proposals (need sign-off before building)
 
@@ -167,6 +255,8 @@ The data layer is already renderer-agnostic, so these are additive — none requ
 multi-symbol, **5B** web/canvas renderer, **5C** wall/iceberg detection. Full design,
 sizing, and build order are in **[PHASE5.md](PHASE5.md)**.
 
-**5A Tier 1 (hot ticker switching)** and **5C (wall/iceberg detection)** are implemented —
-see "Hot ticker switching" and "Microstructure detection" above. The remaining tracks (5A
-Tier 2 simultaneous multi-symbol, 5B web renderer) are still proposals.
+All three tracks are now implemented: **5A** (Tier 1 hot switching in matplotlib; Tier 2
+simultaneous multi-symbol in the browser), **5B** (web renderer — `bridge.py` + `web/`), and
+**5C** (wall/iceberg detection). See the matching sections above. PHASE5.md lists the
+remaining optional polish (Lightweight-Charts frontend, msgpack payloads, runtime add/remove
+of watched symbols).

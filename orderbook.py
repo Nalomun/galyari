@@ -131,6 +131,7 @@ def parse_nasdaq_book(msg: dict) -> Book | None:
     """schwab-py NASDAQ_BOOK message -> Book, or None for an empty/contentless frame.
 
     An empty frame is a valid state (market closed / no entitlement), never an error.
+    Returns only the first content entry — see `parse_books` for the multi-symbol form.
     """
     content = (msg or {}).get("content") or []
     if not content:
@@ -139,6 +140,20 @@ def parse_nasdaq_book(msg: dict) -> Book | None:
     if not book.bids and not book.asks:
         return None
     return book
+
+
+def parse_books(msg: dict) -> list[Book]:
+    """Parse *every* per-symbol content entry into a list of Books (Phase 5A Tier 2).
+
+    One NASDAQ_BOOK message can carry one entry per subscribed symbol; the single-symbol
+    `parse_nasdaq_book` keeps only the first. Empty (no-level) entries are skipped.
+    """
+    out = []
+    for entry in (msg or {}).get("content") or []:
+        book = parse_entry(entry)
+        if book.bids or book.asks:
+            out.append(book)
+    return out
 
 
 @dataclass(frozen=True)

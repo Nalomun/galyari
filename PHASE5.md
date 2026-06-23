@@ -52,7 +52,20 @@ Keep the single heatmap; let the subscribed symbol change at runtime, no restart
 
 **Result:** press `n`/`p` or type a ticker to retarget the live view in ~1 second.
 
-### Tier 2 — Simultaneous multi-symbol (bigger; pairs with 5B)
+### Tier 2 — Simultaneous multi-symbol (bigger; pairs with 5B) — ✅ BUILT (browser)
+
+> **Status: shipped in the browser renderer — small-multiples grid (option (a) below),
+> not the sidebar.** `state.py` is now per-symbol (`_books` / `_trades` dicts + a
+> `_subscribed` guard *set* + a `_focus`), with the single-symbol API preserved verbatim so
+> the matplotlib path and all tests are untouched. `feeds.parse_books` routes every content
+> entry by `key`; `run_schwab_stream(symbols=…)` subscribes the whole watchlist, and
+> `run_simulate(symbols=…)` drives an independent walk per symbol for offline testing. Each
+> frame carries *all* watched symbols in full, so `web/app.js` renders a **grid of live
+> heatmaps**; click a tile to expand to the full single-symbol view (heatmap + volume
+> profile + Δ + CVD + legend, with wheel/`+`/`−` zoom), Esc to return. Cap: `MAX_SYMBOLS = 8`.
+> Tested in `tests/test_multisymbol.py` + `tests/test_bridge.py`. The matplotlib renderer
+> remains single-symbol by design. Design notes kept below — note we ultimately chose the
+> grid (a) over the focus+sidebar (b), since the goal was seeing every symbol at once.
 
 Track several books at once.
 
@@ -78,7 +91,16 @@ that, render in the browser (5B). This is why Tier 2 and 5B are best built toget
 
 ---
 
-## 5B — Web/canvas renderer
+## 5B — Web/canvas renderer — ✅ FIRST SLICE BUILT
+
+> **Status: shipped (vanilla-canvas slice).** `bridge.py` is the asyncio WebSocket
+> publisher described below; `web/index.html` + `web/app.js` are the browser view —
+> dependency-free vanilla canvas (no build step, no charting lib), drawing the heatmap via
+> the texture-shift pattern plus mid line, bid/ask touch + spread band, trade bubbles, a Δ
+> footprint and a CVD strip. Symbol switching from the UI reuses `StreamControl`. Run with
+> `python bridge.py --simulate` and open the printed URL. Tested in `tests/test_bridge.py`.
+> The Lightweight-Charts path below is kept as a future enhancement (free time axis /
+> crosshair / panes) if the vanilla renderer's polish or pan-zoom becomes the bottleneck.
 
 matplotlib `FuncAnimation` + `imshow` + `np.roll` at 3 Hz is fine as a seed but is the
 ceiling: no smooth pan/zoom, limited FPS, redraw cost grows with panel count. A browser
@@ -162,5 +184,10 @@ research deliverable independent of 5A/5B.
 
 1. ~~**5A Tier 1 (hot switching)**~~ — ✅ done.
 2. ~~**5C (wall/iceberg)**~~ — ✅ done.
-3. **5B + 5A Tier 2 together** — the web renderer is the right home for simultaneous
-   multi-symbol layouts and the FPS they need.
+3. ~~**5B web renderer (vanilla-canvas slice)**~~ — ✅ done (`bridge.py` + `web/`).
+4. ~~**5A Tier 2 (simultaneous multi-symbol)**~~ — ✅ done in the browser renderer
+   (`state.py` per-symbol + `feeds` key-routing + focus+sidebar in `web/`).
+
+All Phase 5 tracks are now built. Possible future polish (not committed): a Lightweight
+Charts frontend for free time-axis/crosshair/panes, runtime add/remove of watched symbols,
+and binary (msgpack) frame payloads if JSON bandwidth ever bites.
