@@ -26,3 +26,7 @@ CLAUDE_CODE_KICKOFF.md
 
 # Local agent / editor config
 .claude/
+
+# Private working notes — kept locally, not part of the public repo
+FLAGGED.md
+HANDOFF.md

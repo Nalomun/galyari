@@ -517,6 +517,11 @@ def main():
                     help="disable wall/iceberg detection overlays (Phase 5C)")
     ap.add_argument("--record", action="store_true", help="record frames to recordings/")
     ap.add_argument("--raw", action="store_true", help="dump one book frame then continue")
+    ap.add_argument("--bench", action="store_true",
+                    help="headless (Agg): time update+draw at the normal 300ms cadence and "
+                         "report FPS, frame time and producer-to-paint latency, then exit")
+    ap.add_argument("--bench-secs", type=float, default=60.0, help="bench collection window")
+    ap.add_argument("--bench-out", metavar="FILE", help="also write the bench summary as JSON")
     ap.add_argument("--diag", action="store_true",
                     help="print live book + level-one stats (sizes/levels) to diagnose")
     # creds (env from .env; CLI overrides)
@@ -569,6 +574,8 @@ def main():
                         control=control, diag=args.diag), daemon=True)
     t.start()
 
+    if args.bench:
+        plt.switch_backend("agg")                    # headless: draw() is the full raster
     hm = Heatmap(n_cols=args.cols, n_rows=n_rows, tick=args.tick, autofit=autofit)
     ui = build_figure(hm, title)
     fig, ax, ax_vp, ax_delta, ax_cvd = (ui["fig"], ui["ax"], ui["ax_vp"],
@@ -708,6 +715,13 @@ def main():
         return [im, mid_ln, bid_ln, ask_ln, scat, cvd_ln, vp_line, vp_poc, header,
                 overlays["wall"], overlays["ice"], overlays["pull"]]
 
+    if args.bench:
+        mode = (f"replay {os.path.basename(args.replay)} @{args.speed:g}x" if args.replay
+                else "simulate" if args.simulate else "live")
+        _run_bench(fig, update, args, {"renderer": "matplotlib-agg", "mode": mode,
+                                       "symbols": [title], "cols": args.cols})
+        return
+
     _ = animation.FuncAnimation(fig, update, interval=300, blit=False,
                                 cache_frame_data=False)
     try:
@@ -715,6 +729,45 @@ def main():
     finally:
         if recorder is not None:
             recorder.close()
+
+
+def _run_bench(fig, update, args, meta, period_s=0.3, warmup_s=3.0):
+    """Drive `update` + a full `canvas.draw()` at the FuncAnimation cadence (300 ms) and
+    time it. Latency is producer ingest → end of the draw that first shows that book."""
+    import json
+    import time
+    import bench
+
+    b = bench.new_samples()
+    last_ing = None
+    t_start = time.perf_counter()
+    t_on, t_end = t_start + warmup_s, t_start + warmup_s + args.bench_secs
+    next_t = t_start
+    print(f"[bench] matplotlib/Agg {meta['mode']}: {args.bench_secs:.0f}s after "
+          f"{warmup_s:.0f}s warm-up", flush=True)
+    while True:
+        t0 = time.perf_counter()
+        if t0 >= t_end:
+            break
+        update(0)
+        fig.canvas.draw()
+        t1 = time.perf_counter()
+        sym = state.get_focus()
+        ing = state.get_ingest_ms(sym) if sym else None
+        if t0 >= t_on:
+            b["paints"] += 1
+            b["render_ms"].append((t1 - t0) * 1000.0)
+            if ing is not None and ing != last_ing:
+                b["lat"].append([time.time() * 1000.0 - ing])
+        last_ing = ing
+        next_t += period_s
+        time.sleep(max(0.0, next_t - time.perf_counter()))
+    b["window_ms"] = (time.perf_counter() - t_on) * 1000.0
+    summ = {**meta, **bench.summary(b)}
+    print("[bench] " + json.dumps(summ, indent=2), flush=True)
+    if args.bench_out:
+        with open(args.bench_out, "w") as f:
+            json.dump(summ, f, indent=2)
 
 
 def _draw_overlays(hm, micro, overlays, show):

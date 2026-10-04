@@ -18,6 +18,7 @@ matplotlib-free on purpose: this is part of the producer/renderer seam.
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 
 from orderbook import Book, Trade
@@ -33,6 +34,9 @@ _trades: dict[str, deque[Trade]] = {}
 _subscribed: set[str] | None = None
 # The symbol the no-arg getters return — the matplotlib view, or the browser's main panel.
 _focus: str | None = None
+# Wall-clock ms at which each symbol's latest book was stored — the producer end of the
+# producer-to-paint latency that `--bench` reports. One float per symbol; nothing else reads it.
+_ingest_ms: dict[str, float] = {}
 
 
 def _dq(symbol: str) -> deque[Trade]:
@@ -58,6 +62,7 @@ def set_book(book: Book | None) -> None:
         if _focus is None:
             _focus = book.symbol
         _books[book.symbol] = book
+        _ingest_ms[book.symbol] = time.time() * 1000.0
 
 
 def add_trade(trade: Trade) -> None:
@@ -79,6 +84,12 @@ def get_books() -> dict[str, Book]:
     """Snapshot of every tracked symbol's latest book (for multi-symbol sidebars)."""
     with _lock:
         return dict(_books)
+
+
+def get_ingest_ms(symbol: str) -> float | None:
+    """Wall-clock ms when `symbol`'s current book was stored (None if never)."""
+    with _lock:
+        return _ingest_ms.get(symbol)
 
 
 def drain_trades(symbol: str | None = None) -> list[Trade]:
@@ -115,6 +126,7 @@ def set_subscribed(symbols, focus: str | None = None) -> None:
     with _lock:
         _books.clear()
         _trades.clear()
+        _ingest_ms.clear()
         _subscribed = set(syms)
         _focus = focus if focus is not None else (syms[0] if syms else None)
 
@@ -153,6 +165,7 @@ def clear_for_symbol(symbol: str) -> None:
     with _lock:
         _books.clear()
         _trades.clear()
+        _ingest_ms.clear()
         _subscribed = {symbol}
         _focus = symbol
 
@@ -163,5 +176,6 @@ def reset() -> None:
     with _lock:
         _books.clear()
         _trades.clear()
+        _ingest_ms.clear()
         _subscribed = None
         _focus = None

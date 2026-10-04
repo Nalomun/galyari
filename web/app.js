@@ -6,7 +6,8 @@
 // bins, so zoom is a lossless display crop — never a rebuild. No build step, no library.
 "use strict";
 
-const WS_PORT = 8765;                                // matches bridge --ws-port default
+// WS port: bridge --ws-port default, overridable via ?ws=NNNN (run a 2nd instance to compare)
+const WS_PORT = Number(new URLSearchParams(location.search).get("ws")) || 8765;
 const C = { bg: "#070b12", panel: "#0d1420", grid: "#27384d", fg: "#dde6f0",
             muted: "#93a4bd", buy: "#36d68f", sell: "#ff6b66", mid: "#eaf1f8",
             vp: "#5a9fd4", poc: "#ffd23f" };
@@ -22,6 +23,17 @@ function ramp(t) {
 }
 const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 
+// Phase F honesty gate: CVD/delta are only as trustworthy as the aggressor tape is
+// unambiguous. `a` is the rolling fraction of prints printed inside the spread (side
+// unknown). Returns how to render CVD: a dim/warn color + label when it's soft/mush.
+function ambStyle(a) {
+  if (a == null) return { cvdColor: null, soft: false, label: null, labelColor: C.muted };
+  const pct = `amb ${Math.round(a * 100)}%`;
+  if (a < 0.15) return { cvdColor: null, soft: false, label: pct, labelColor: C.muted };
+  if (a < 0.35) return { cvdColor: "#caa84a", soft: true, label: pct, labelColor: "#caa84a" };
+  return { cvdColor: C.muted, soft: true, label: pct + "⚠", labelColor: C.sell };
+}
+
 let tick = 0.01, cols = 240, live = false, multi = false;
 let order = [], expanded = null;
 const views = new Map();
@@ -36,7 +48,7 @@ class View {
     this.ask = Array(cols).fill(NaN); this.cvd = Array(cols).fill(NaN);
     this.delta = Array(cols).fill(0);
     this.trades = []; this.sizeRef = 100; this.lastCvd = 0; this.lastMid = NaN;
-    this.lastSpread = NaN; this.lastImb = 0; this.book = { bids: [], asks: [] };
+    this.lastSpread = NaN; this.lastImb = 0; this.lastAmb = null; this.book = { bids: [], asks: [] };
     this.viewRows = 0; this.center = null;
     this.off = document.createElement("canvas"); this.offctx = this.off.getContext("2d");
   }
@@ -79,7 +91,8 @@ class View {
     }
     this.updateCenter();
     this.lastCvd = p.cvd; this.lastSpread = p.spread == null ? NaN : p.spread;
-    this.lastImb = p.imbalance || 0; this.book = { bids: p.bids || [], asks: p.asks || [] };
+    this.lastImb = p.imbalance || 0; this.lastAmb = p.ambiguity == null ? null : p.ambiguity;
+    this.book = { bids: p.bids || [], asks: p.asks || [] };
   }
   loAbs() { return this.absRow(this.center) - (this.viewRows >> 1); }
   vmax(lo) {
@@ -189,8 +202,17 @@ function drawTile(v, R) {
   ctx.font = "12px monospace"; ctx.fillStyle = C.fg;
   ctx.fillText(Number.isNaN(v.lastMid) ? "—" : v.lastMid.toFixed(2),
     R.x + 12 + ctx.measureText(v.sym).width, R.y + 12);
-  ctx.textAlign = "right"; ctx.fillStyle = v.lastCvd >= 0 ? C.buy : C.sell;
-  ctx.fillText(`CVD ${v.lastCvd >= 0 ? "+" : ""}${Math.round(v.lastCvd)}`, R.x + R.w - 8, R.y + 12);
+  ctx.textAlign = "right";
+  const as = ambStyle(v.lastAmb);
+  ctx.fillStyle = as.cvdColor || (v.lastCvd >= 0 ? C.buy : C.sell);
+  const cvdTxt = `${as.soft ? "~" : ""}CVD ${v.lastCvd >= 0 ? "+" : ""}${Math.round(v.lastCvd)}`;
+  ctx.fillText(cvdTxt, R.x + R.w - 8, R.y + 12);
+  if (as.label) {                                   // ambiguity readout just left of CVD
+    const w = ctx.measureText(cvdTxt).width;
+    ctx.font = "10px monospace"; ctx.fillStyle = as.labelColor;
+    ctx.fillText(as.label, R.x + R.w - 12 - w, R.y + 12);
+    ctx.font = "12px monospace";
+  }
   ctx.textAlign = "left";
 }
 
@@ -330,9 +352,17 @@ function drawHeader(v, R) {
   ctx.fillStyle = "#fff"; ctx.fillText(v.sym, x0, R.y + 16);
   ctx.font = "13px monospace"; ctx.fillStyle = C.fg;
   const sp = Number.isNaN(v.lastSpread) ? "—" : v.lastSpread.toFixed(2);
-  ctx.fillText(`mid ${Number.isNaN(v.lastMid) ? "—" : v.lastMid.toFixed(2)}    spread ${sp}` +
-    `    imb ${(v.lastImb * 100).toFixed(0)}%    CVD ${v.lastCvd >= 0 ? "+" : ""}${Math.round(v.lastCvd)}`,
-    x0 + 58, R.y + 16);
+  const as = ambStyle(v.lastAmb);
+  const head = `mid ${Number.isNaN(v.lastMid) ? "—" : v.lastMid.toFixed(2)}    spread ${sp}` +
+    `    imb ${(v.lastImb * 100).toFixed(0)}%    ${as.soft ? "~" : ""}CVD ` +
+    `${v.lastCvd >= 0 ? "+" : ""}${Math.round(v.lastCvd)}    `;
+  ctx.fillText(head, x0 + 58, R.y + 16);
+  if (as.label) {                                   // colored ambiguity token after the readout
+    ctx.fillStyle = as.labelColor;
+    ctx.fillText(as.label + (as.soft ? " (CVD soft)" : ""), x0 + 58 + ctx.measureText(head).width,
+      R.y + 16);
+    ctx.fillStyle = C.fg;
+  }
   ctx.fillStyle = C.muted; ctx.textAlign = "right";
   ctx.fillText("scroll / ± to zoom", R.w - 12, R.y + 16); ctx.textAlign = "left";
   if (multi) {
@@ -362,7 +392,61 @@ function render() {
     if (sym) drawFull(getView(sym), { x: 0, y: 0, w: W, h: H });
   }
 }
-function loop() { requestAnimationFrame(loop); if (dirty) { render(); dirty = false; } }
+function loop() {
+  requestAnimationFrame(loop);
+  if (bench) benchFrame();
+  if (dirty) {
+    const t0 = performance.now(); render(); dirty = false;
+    if (bench) benchRender(performance.now() - t0);
+  }
+}
+
+// --- bench (bridge --bench) -------------------------------------------------
+// Measures render cost and producer→paint latency here, ships batches to the bridge,
+// which prints the summary. "Paint" = the first animation frame after the render that
+// drew a book, i.e. the frame its pixels are committed in. Times are wall-clock ms.
+let bench = null;
+const wallNow = () => performance.timeOrigin + performance.now();
+const BENCH_WARMUP_MS = 3000, BENCH_FLUSH_MS = 2000;
+function benchStart() {
+  const now = performance.now();
+  bench = { from: now + BENCH_WARMUP_MS, flushAt: now + BENCH_WARMUP_MS + BENCH_FLUSH_MS,
+            winStart: now + BENCH_WARMUP_MS, render_ms: [], lat: [], paints: 0, rafs: 0,
+            queued: [], drawn: [], lastIngest: {} };
+}
+function benchOnFrame(f, recv) {                 // a book is "new" when its ingest stamp changes
+  const syms = order.length ? order : [...views.keys()];
+  const shown = (multi && !expanded && syms.length > 1) ? syms : [expanded || syms[0]];
+  for (const sym of shown) {
+    if (!f.symbols[sym]) continue;
+    const ing = f.symbols[sym].ingest;
+    if (ing == null || ing === bench.lastIngest[sym]) continue;
+    bench.lastIngest[sym] = ing;
+    bench.queued.push({ ing, sent: f.sent, recv });
+  }
+}
+function benchRender(ms) {
+  const on = performance.now() >= bench.from;
+  if (on) { bench.render_ms.push(ms); bench.paints++; }
+  bench.drawn = on ? bench.queued : [];
+  bench.queued = [];
+}
+function benchFrame() {
+  const now = performance.now();
+  if (now < bench.from) return;
+  bench.rafs++;
+  if (bench.drawn.length) {
+    const t = wallNow();
+    for (const d of bench.drawn) bench.lat.push([t - d.ing, d.sent - d.ing, d.recv - d.sent, t - d.recv]);
+    bench.drawn = [];
+  }
+  if (now >= bench.flushAt && ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: "bench", window_ms: now - bench.winStart, paints: bench.paints,
+      rafs: bench.rafs, render_ms: bench.render_ms, lat: bench.lat }));
+    bench.render_ms = []; bench.lat = []; bench.paints = 0; bench.rafs = 0;
+    bench.winStart = now; bench.flushAt = now + BENCH_FLUSH_MS;
+  }
+}
 
 // --- interaction ------------------------------------------------------------
 function viewAt(mx, my) {
@@ -406,6 +490,7 @@ function connect() {
   ws.onopen = () => { status.textContent = "connected"; status.className = "live"; };
   ws.onclose = () => { status.textContent = "disconnected — retrying"; status.className = "down"; setTimeout(connect, 1500); };
   ws.onmessage = (ev) => {
+    const recv = bench ? wallNow() : 0;
     const f = JSON.parse(ev.data);
     if (f.type === "hello") {
       live = f.live; multi = f.multi; tick = f.tick; cols = f.cols; order = f.order || [];
@@ -416,12 +501,14 @@ function connect() {
         ? "click a tile to expand · scroll to zoom"
         : (live ? "type a symbol to switch · scroll to zoom" : "scroll to zoom");
       document.getElementById("go").disabled = !live;
+      if (f.bench) benchStart();
       updateTitle(); return;
     }
     if (f.type === "frame") {
       if (f.order && f.order.length) order = f.order;
       for (const sym in f.symbols) getView(sym).ingest(f.symbols[sym]);
       if (!order.length) order = Object.keys(f.symbols);
+      if (bench) benchOnFrame(f, recv);
       updateTitle(); dirty = true;
     }
   };

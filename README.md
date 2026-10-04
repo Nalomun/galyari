@@ -6,6 +6,9 @@ scrolls right-to-left across the x-axis, and color intensity is the resting size
 price level. The goal is to *see* market microstructure that a candlestick chart hides:
 where liquidity rests, where walls build and get pulled, absorption, and imbalance.
 
+**Dates:** Aug 2025 – Jul 2026. This public repository is a snapshot of private work begun in
+August 2025; its commit history starts on 2026-06-22.
+
 ![mode: simulate](https://img.shields.io/badge/offline_mode-simulate-blue) ![data: Schwab NASDAQ_BOOK](https://img.shields.io/badge/live_data-Schwab%20NASDAQ__BOOK-orange)
 
 ## Why this exists
@@ -171,6 +174,9 @@ sweet spot.
 | `--no-micro` | off | disable wall/iceberg/pull detection overlays |
 | `--raw` | off | dump one raw book frame then continue |
 | `--diag` | off | print live book + level-one + heatmap stats (for diagnosing) |
+| `--bench` | off | measure FPS, frame time and producer-to-paint latency, print, exit (see [Measured performance](#measured-performance)) |
+| `--bench-secs S` | `60` | bench collection window (after a 3 s warm-up) |
+| `--bench-out FILE` | — | also write the bench summary as JSON |
 
 ### Keyboard controls (in the window)
 
@@ -222,10 +228,60 @@ bottom. A color/marker **legend** sits in the empty lower-right.
 > approximation for trade-level research. See
 > [DATA_SCHEMA.md](DATA_SCHEMA.md#trades-derived-from-level_one_equity).
 
+## Measured performance
+
+Measured with `--bench` on 2026-10-04. Hardware and software: Intel Core Ultra 7 258V
+(8 cores), Fedora 42 (kernel 6.19), Python 3.13.13, matplotlib 3.11.0. The browser was
+headless Chromium 153 at a 1600×900 viewport, driven by `tools/bench_browser.cjs`. Each run
+is 60 s after a 3 s warm-up; the stress run is 30 s.
+
+| renderer | source | render FPS | frame time p50 / p95 (ms) | producer→paint p50 / p95 (ms) | latency samples |
+|---|---|---:|---:|---:|---:|
+| browser | simulator, 1 symbol | 3.98 | 7.8 / 19.3 | 131.6 / 195.1 | 240 |
+| browser | simulator, 4-symbol grid | 3.96 | 22.8 / 32.6 | 110.5 / 170.8 | 956 |
+| browser | replay, recorded GOOG tape, 1× | 3.98 | 2.7 / 4.5 | 173.6 / 252.9 | 58 |
+| browser | simulator, 1 symbol, `--hz 60` (stress) | 57.29 | 6.8 / 11.1 | 34.3 / 45.9 | 120 |
+| matplotlib (Agg) | simulator | 3.33 | 86.8 / 93.5 | 124.1 / 238.3 | 200 |
+| matplotlib (Agg) | replay, same GOOG tape, 1× | 3.33 | 82.3 / 86.5 | 162.7 / 287.9 | 57 |
+
+What the columns mean:
+
+- **Render FPS** is frames drawn per second. It is capped by design: the bridge broadcasts at
+  `--hz` (default 4), and matplotlib redraws on a 300 ms timer. The `--hz 60` row shows the
+  browser renderer keeping up with a 60 Hz display at this frame cost.
+- **Frame time** for the browser is the JavaScript `render()` call. For matplotlib it is
+  `update()` plus a full `canvas.draw()` on the Agg backend. A window backend adds its blit
+  on top.
+- **Producer→paint** runs from the producer storing a new book in `state.py` to:
+  - browser: the first animation frame after the render that drew it;
+  - matplotlib: the end of the draw that first shows it.
+
+  Only books for symbols on screen are counted. It does **not** include exchange → Schwab →
+  this machine; that path isn't measured.
+- **Latency breakdown, browser at 4 Hz.** Most of the latency is waiting for the next broadcast
+  tick, at p50 103 ms (simulator), 70 ms (grid) and 144 ms (replay). WebSocket transfer is
+  ~1–2 ms. Receive→paint is 25–35 ms. At `--hz 60`, producer→paint drops to 34 ms p50.
+- **Latency samples** are new books. The recorded tape delivers about one book per second,
+  the feed's real cadence (median 1.0–1.5 s between book snapshots on the recorded tapes),
+  so replay rows have fewer samples than simulator rows.
+
+Reproduce (tapes are not in the repo; use your own recording):
+
+```bash
+npm install playwright-core      # once, for the headless driver
+python bridge.py --simulate --bench --web-port 8091 --ws-port 8796 &
+node tools/bench_browser.cjs "http://127.0.0.1:8091/?ws=8796" 70
+python schwab_orderflow_heatmap.py --replay recordings/<tape>.jsonl --bench
+```
+
+`bridge.py --bench` also works with an ordinary browser tab open on the printed URL. That
+measures your real GPU and compositor instead of headless Chromium.
+
 ## Market-hours & entitlement caveats
 
-Live book data flows **only during the regular session (~9:30–16:00 ET)** and requires
-your account to carry a **Level 2 / book entitlement**. **Silence after the `subscribed`
+Live book data flows during the regular session and after the close (the recorded tapes
+contain book data until 19:59 ET), and it requires your account to carry a **Level 2 / book
+entitlement**. **Silence after the `subscribed`
 log line is normal** when the market is closed or you lack the entitlement — it is not a
 bug, and an empty book is never treated as an error. Use `--simulate` any time.
 
@@ -238,6 +294,8 @@ bug, and an empty book is never treated as an error. Use `--simulate` any time.
   the renderer/data seam, and known limitations.
 - [DATA_SCHEMA.md](DATA_SCHEMA.md) — the `NASDAQ_BOOK` wire schema, the snapshot-vs-delta
   finding, and the parsed `Book` structure.
+- [docs/SIGNAL_STUDY.md](docs/SIGNAL_STUDY.md) — whether the detectors' signals predict
+  short-horizon returns (they don't, after correction): method, sample, results.
 
 ## Status
 

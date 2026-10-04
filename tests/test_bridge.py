@@ -69,3 +69,38 @@ def test_sim_order_falls_back_to_books_when_unsubscribed():
     state.set_book(_book("SIM", 100))                   # sim: no subscribed set
     msg = json.loads(bridge._build_message(_rt(subscribed=())))
     assert msg["order"] == ["SIM"] and "SIM" in msg["symbols"]
+
+
+def test_bench_summary_percentiles_and_fps():
+    import bench
+    b = bench.new_samples()
+    b["window_ms"] = 10_000.0
+    b["paints"], b["rafs"] = 40, 600
+    b["render_ms"] = [float(x) for x in range(1, 101)]          # 1..100
+    b["lat"] = [[float(x), 1.0, 0.5, 2.0] for x in range(1, 101)]
+    s = bench.summary(b)
+    assert s["render_fps"] == 4.0 and s["raf_fps"] == 60.0
+    assert s["render_ms_p50"] == 50.0 and s["render_ms_p95"] == 95.0
+    assert s["ingest_to_paint_ms_p95"] == 95.0 and s["sent_to_recv_ms_p50"] == 0.5
+
+
+def test_bench_summary_matplotlib_rows_have_one_column():
+    import bench
+    b = {**bench.new_samples(), "window_ms": 3000.0, "paints": 10,
+         "render_ms": [80.0] * 10, "lat": [[120.0]] * 10}
+    s = bench.summary(b)
+    assert s["ingest_to_paint_ms_p50"] == 120.0
+    assert "sent_to_recv_ms_p50" not in s and "raf_fps" not in s
+
+
+def test_state_records_ingest_time():
+    import time
+    import state
+    from orderbook import Book, Level
+    state.reset()
+    before = time.time() * 1000.0
+    state.set_book(Book(symbol="X", ts_ms=0, bids=(Level(1.0, 100),), asks=(Level(1.01, 100),)))
+    ing = state.get_ingest_ms("X")
+    assert ing is not None and before <= ing <= time.time() * 1000.0
+    state.reset()
+    assert state.get_ingest_ms("X") is None

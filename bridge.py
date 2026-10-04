@@ -31,6 +31,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 
 try:
     from dotenv import load_dotenv
@@ -38,6 +39,7 @@ try:
 except ImportError:
     pass
 
+import bench
 import feeds
 import state
 
@@ -71,12 +73,18 @@ def _display_symbols(rt, books):
 def _symbol_payload(rt, sym, book):
     """Full per-symbol state for one grid tile: book arrays, the *new* prints since the
     last frame, and server-accumulated CVD + this-tick delta (so reconnects stay
-    consistent). Draining happens here, once per symbol per tick."""
+    consistent). Draining happens here, once per symbol per tick.
+
+    Also tracks a rolling aggressor-**ambiguity** rate (Phase A/F): the fraction of recent
+    prints whose side is `unknown` (printed inside the spread). CVD is only as trustworthy
+    as this is low — the browser uses it to de-emphasize CVD when it spikes."""
     rt["cvd"].setdefault(sym, 0.0)
+    amb = rt.setdefault("amb", {}).setdefault(sym, deque(maxlen=200))  # 1=unknown, 0=signed
     net, trs = 0.0, []
     for t in state.drain_trades(sym):
         rt["cvd"][sym] += t.side * t.size
         net += t.side * t.size
+        amb.append(0 if t.side else 1)
         trs.append({"p": t.price, "s": t.size, "side": t.side})
     return {
         "bids": [[l.price, l.volume] for l in book.bids] if book is not None else [],
@@ -86,6 +94,8 @@ def _symbol_payload(rt, sym, book):
         "imbalance": _imbalance(book) if book is not None else None,
         "ts": book.ts_ms if book is not None else None,
         "trades": trs, "cvd": rt["cvd"][sym], "delta": net,
+        "ambiguity": (sum(amb) / len(amb)) if amb else None,
+        **({"ingest": state.get_ingest_ms(sym)} if rt.get("bench") else {}),
     }
 
 
@@ -96,10 +106,11 @@ def _build_message(rt) -> str:
     order = _display_symbols(rt, books)
     # include any symbol that has a book even if not in `order` (defensive)
     syms = order + [s for s in books if s not in order]
-    return json.dumps({
-        "type": "frame", "focus": state.get_focus(), "order": order,
-        "symbols": {s: _symbol_payload(rt, s, books.get(s)) for s in syms},
-    })
+    msg = {"type": "frame", "focus": state.get_focus(), "order": order,
+           "symbols": {s: _symbol_payload(rt, s, books.get(s)) for s in syms}}
+    if rt.get("bench"):
+        msg["sent"] = time.time() * 1000.0
+    return json.dumps(msg)
 
 
 # --- server loops ------------------------------------------------------------
@@ -126,11 +137,14 @@ async def _handler(ws, rt: dict, control):
         await ws.send(json.dumps({"type": "hello", "focus": state.get_focus() or rt["focus"],
                                   "order": rt["subscribed"], "tick": rt["tick"],
                                   "cols": rt["cols"], "live": control is not None,
-                                  "multi": rt["multi"]}))
+                                  "multi": rt["multi"], "bench": rt.get("bench", False)}))
         async for raw in ws:
             try:
                 cmd = json.loads(raw)
             except (ValueError, TypeError):
+                continue
+            if cmd.get("type") == "bench" and rt.get("bench"):
+                _bench_ingest(rt["bench"], cmd)
                 continue
             if cmd.get("type") != "switch" or not cmd.get("symbol") or control is None:
                 continue
@@ -147,6 +161,42 @@ async def _handler(ws, rt: dict, control):
             rt["focus"] = sym
     finally:
         CLIENTS.discard(ws)
+
+
+# --- bench (--bench) ----------------------------------------------------------
+# The browser measures; the bridge aggregates and prints. Each batch the page sends is
+#   {"type": "bench", "window_ms", "paints", "rafs", "render_ms": [...],
+#    "lat": [[ingest→paint, ingest→sent, sent→recv, recv→paint], ...]}
+# where "paint" is the first animation frame after the render that drew that book (the
+# frame the canvas content is committed in). Times are wall-clock ms on one machine.
+def _bench_ingest(b: dict, cmd: dict) -> None:
+    try:
+        b["window_ms"] += float(cmd["window_ms"])
+        b["paints"] += int(cmd["paints"])
+        b["rafs"] += int(cmd["rafs"])
+        b["render_ms"].extend(float(x) for x in cmd["render_ms"])
+        b["lat"].extend([float(v) for v in row] for row in cmd["lat"])
+    except (KeyError, TypeError, ValueError):
+        pass
+
+
+async def _bench_watch(rt: dict, secs: float, out_path: str | None) -> None:
+    """Wait for the first batch, collect for `secs`, then print the summary and return
+    (which ends the bridge)."""
+    b = rt["bench"]
+    print("[bench] waiting for a browser — open the URL above "
+          "(or: node tools/bench_browser.cjs <url> <secs>)", flush=True)
+    while not b["render_ms"]:
+        await asyncio.sleep(0.2)
+    print(f"[bench] collecting for {secs:.0f}s ...", flush=True)
+    while b["window_ms"] < secs * 1000.0:
+        await asyncio.sleep(0.5)
+    summ = {**b["meta"], **bench.summary(b)}
+    print("[bench] " + json.dumps(summ, indent=2), flush=True)
+    if out_path:
+        with open(out_path, "w") as f:
+            json.dump(summ, f, indent=2)
+        print(f"[bench] wrote {out_path}", flush=True)
 
 
 def _serve_static(host: str, port: int):
@@ -194,7 +244,12 @@ def _start_producer(args, symbols, multi):
 async def _run(args, control, rt):
     async with websockets.serve(lambda ws: _handler(ws, rt, control),
                                 args.host, args.ws_port):
-        await _push_loop(1.0 / max(args.hz, 0.5), rt)
+        push = asyncio.create_task(_push_loop(1.0 / max(args.hz, 0.5), rt))
+        if not rt.get("bench"):
+            await push
+            return
+        await _bench_watch(rt, args.bench_secs, args.bench_out)
+        push.cancel()
 
 
 def main():
@@ -211,6 +266,11 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--ws-port", type=int, default=8765, help="WebSocket data port")
     ap.add_argument("--web-port", type=int, default=8080, help="static frontend port")
+    ap.add_argument("--bench", action="store_true",
+                    help="measure render FPS, frame time and producer-to-paint latency in the "
+                         "connected browser, print a summary, then exit")
+    ap.add_argument("--bench-secs", type=float, default=60.0, help="bench collection window")
+    ap.add_argument("--bench-out", metavar="FILE", help="also write the bench summary as JSON")
     ap.add_argument("--api-key", default=os.environ.get("SCHWAB_API_KEY"))
     ap.add_argument("--app-secret", default=os.environ.get("SCHWAB_APP_SECRET"))
     ap.add_argument("--callback-url",
@@ -242,6 +302,13 @@ def main():
     rt = {"focus": focus0, "tick": args.tick, "cols": args.cols,
           "subscribed": subscribed if multi else ([] if not control else subscribed),
           "multi": multi, "cvd": {}, "delta": {}}
+    if args.bench:
+        mode = (f"replay {os.path.basename(args.replay)} @{args.speed:g}x" if args.replay
+                else "simulate" if args.simulate else "live")
+        rt["bench"] = {**bench.new_samples(),
+                       "meta": {"renderer": "browser", "mode": mode,
+                                "symbols": subscribed or [title], "hz": args.hz,
+                                "cols": args.cols}}
 
     _serve_static(args.host, args.web_port)
     where = f"{title} [{', '.join(subscribed)}]" if multi else title
