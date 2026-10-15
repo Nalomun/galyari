@@ -45,7 +45,7 @@ pip install -r requirements.txt
 ## Configure (live mode only)
 
 Simulate mode needs **no credentials**. For live Schwab data, create a `.env` in this
-folder (a template ships as `.env`; never commit the real one — it's gitignored):
+folder (copy the template: `cp .env.example .env`; never commit the real one — it's gitignored):
 
 ```
 SCHWAB_API_KEY=...            # App Key from developer.schwab.com
