@@ -9,6 +9,9 @@ where liquidity rests, where walls build and get pulled, absorption, and imbalan
 **Dates:** Aug 2025 – Jul 2026. This public repository is a snapshot of private work begun in
 August 2025; its commit history starts on 2026-06-22.
 
+I designed Galyari and made the calls about what to build, what to measure and what the results
+mean; the code was written with Claude Code.
+
 ![mode: simulate](https://img.shields.io/badge/offline_mode-simulate-blue) ![data: Schwab NASDAQ_BOOK](https://img.shields.io/badge/live_data-Schwab%20NASDAQ__BOOK-orange)
 
 ## Why this exists
