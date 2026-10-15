@@ -240,12 +240,17 @@ Measured with `--bench` on 2026-10-04. Hardware and software: Intel Core Ultra 7
 headless Chromium 153 at a 1600×900 viewport, driven by `tools/bench_browser.cjs`. Each run
 is 60 s after a 3 s warm-up; the stress run is 30 s.
 
+All rows except the stress row use default settings: the browser gets a new frame 4 times a
+second (`--hz 4`) and matplotlib redraws every 300 ms, so about 4 FPS (browser) and 3.3 FPS (matplotlib) is the normal behaviour.
+The stress row is a simulator run with the broadcast rate raised to `--hz 60`. It shows how
+much headroom the browser renderer has, not how it runs by default.
+
 | renderer | source | render FPS | frame time p50 / p95 (ms) | producer→paint p50 / p95 (ms) | latency samples |
 |---|---|---:|---:|---:|---:|
 | browser | simulator, 1 symbol | 3.98 | 7.8 / 19.3 | 131.6 / 195.1 | 240 |
 | browser | simulator, 4-symbol grid | 3.96 | 22.8 / 32.6 | 110.5 / 170.8 | 956 |
 | browser | replay, recorded GOOG tape, 1× | 3.98 | 2.7 / 4.5 | 173.6 / 252.9 | 58 |
-| browser | simulator, 1 symbol, `--hz 60` (stress) | 57.29 | 6.8 / 11.1 | 34.3 / 45.9 | 120 |
+| browser | simulator, 1 symbol, `--hz 60` (stress, not default) | 57.29 | 6.8 / 11.1 | 34.3 / 45.9 | 120 |
 | matplotlib (Agg) | simulator | 3.33 | 86.8 / 93.5 | 124.1 / 238.3 | 200 |
 | matplotlib (Agg) | replay, same GOOG tape, 1× | 3.33 | 82.3 / 86.5 | 162.7 / 287.9 | 57 |
 
