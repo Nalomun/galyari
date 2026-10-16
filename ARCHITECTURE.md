@@ -95,6 +95,11 @@ Empty book is a **valid state**, never an error (market closed / no entitlement)
 | `feeds.py` | Producers: live Schwab stream, simulator, replay reader; `StreamControl` for hot switching. | No |
 | `recorder.py` | Append-only JSONL recording of raw frames. | No |
 | `microstructure.py` | **Consumer of the core.** Wall / pull / iceberg detection over the `Book`/`Trade` stream. Stdlib only. | No |
+| `levels.py` | Tracks price levels (manual, HOD/LOD, VWAP, round numbers, volume nodes) and classifies each as watching / defended / absorbing / vacuum / broken, emitting an event on every state change. | No |
+| `walls.py` | Follows each detected wall to its end and labels the ending refresh, pull or eaten. | No |
+| `runway.py` | Scores the displayed liquidity beyond a level, scaled to the stock's typical level size. | No |
+| `events.py` | Replays a recording through the detectors into a timestamped event log and labels each event with forward mid-price returns. | No |
+| `signals.py` | Runs the permutation test, Holm correction and cross-stock sign gate over labeled events and writes a markdown report. | No |
 | `schwab_orderflow_heatmap.py` | CLI entrypoint + matplotlib renderer (`Heatmap`). | Yes |
 | `bridge.py` + `web/` | Alternative frontend (Phase 5B): WebSocket publisher + browser canvas. Reads the same `state.py` getters; needs `websockets`, not matplotlib. | No |
 

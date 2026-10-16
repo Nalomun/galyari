@@ -4,8 +4,10 @@
 comparisons made. Two individual test cells survive the correction, but each belongs to a
 signal whose direction reverses between stocks.
 
-This is a summary of method, sample and results. The study code and the recordings it ran on
-are not published. The recordings are licensed market data.
+This is a summary of method, sample and results. The detectors that generate the events, the
+event labeler and the significance test are in the repo: `levels.py`, `walls.py`, `runway.py`,
+`events.py` and `signals.py`. The recordings the study ran on are not published because they
+are licensed market data, so the study can't be re-run from the repo alone.
 
 ## Question
 

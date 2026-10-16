@@ -298,6 +298,21 @@ bug, and an empty book is never treated as an error. Use `--simulate` any time.
 > Harmless noise: `MESA-INTEL ... FINISHME` lines are Intel GPU/Vulkan warnings from the
 > matplotlib window. Ignore them.
 
+## Detector modules
+
+Offline, stdlib-only consumers of the parsed book; not used by the live renderer.
+
+- [`levels.py`](levels.py) — tracks price levels and classifies each as watching, defended,
+  absorbing, vacuum or broken.
+- [`walls.py`](walls.py) — follows each detected wall to its end and labels it refresh, pull
+  or eaten.
+- [`runway.py`](runway.py) — scores the displayed liquidity beyond a level, scaled to the
+  stock's typical level size.
+- [`events.py`](events.py) — replays a recording into a timestamped event log and labels each
+  event with forward mid-price returns.
+- [`signals.py`](signals.py) — runs the permutation test, Holm correction and sign gate over
+  labeled events.
+
 ## Docs
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — threading model, shared-state contract, data flow,
